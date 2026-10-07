@@ -1,6 +1,6 @@
-# DEVELOPER THANHTUNG VIP · MD5 TELEGRAM ANALYZER
-# MD5-only · HASH-64 DEBIASED · no game boards / no web server
-# Run: python bot_tele.py
+# DEVELOPER THANHTUNG VIP · MD5 + SHA256 TELEGRAM ANALYZER
+# Auto detect 32-hex MD5 / 64-hex SHA256 · HASH-64 DEBIASED
+# Run: python bot_md5.py
 
 import os
 import re
@@ -18,9 +18,10 @@ ADMIN_IDS = {int(x) for x in os.getenv('ADMIN_IDS','').replace(';',',').split(',
 BOT_POLL_TIMEOUT = max(5, int(os.getenv('BOT_POLL_TIMEOUT', '20')))
 BOT_NAME = 'DEVELOPER THANHTUNG VIP'
 MD5_RE = re.compile(r'^[0-9a-fA-F]{32}$')
+SHA256_RE = re.compile(r'^[0-9a-fA-F]{64}$')
 CACHE_MAX = 16384
 _CACHE = OrderedDict()
-_STATS = {'started': time.time(), 'total': 0, 'md5': 0, 'private': 0, 'group': 0}
+_STATS = {'started': time.time(), 'total': 0, 'md5': 0, 'sha256': 0, 'private': 0, 'group': 0}
 SEM = asyncio.Semaphore(64)
 
 
@@ -70,9 +71,12 @@ def _byte_quads(d):
     return out
 
 
-def md5_hash64(z):
-    """64 symmetric/centered statistical signals. No random numbers."""
+def hash_signal64(z):
+    """64 symmetric/centered statistical signals for 32/64-hex hashes. No random numbers."""
     z=z.lower()
+    L=len(z)
+    if L not in (32,64) or not re.fullmatch(r'[0-9a-f]+',z):
+        raise ValueError('hash must be 32 or 64 hexadecimal characters')
     nib=[int(c,16) for c in z]
     bs=list(bytes.fromhex(z))
     bits=[(b>>k)&1 for b in bs for k in range(7,-1,-1)]
@@ -82,19 +86,20 @@ def md5_hash64(z):
     def add(v):
         sig.append(clamp(float(v),-1.0,1.0))
 
+    # Split into four equal quarters for either MD5 (8 nibbles) or SHA256 (16 nibbles).
+    q=max(1,L//4)
+    quarters=[nib[i*q:(i+1)*q] if i<3 else nib[i*q:] for i in range(4)]
+
     # G1 · nibble distribution (8)
-    for i in range(4):
-        p=nib[i*8:(i+1)*8]
-        add(centered(sum(p)/8,7.5,5.0))
-    for i in range(4):
-        p=nib[i*8:(i+1)*8]
-        add(centered(sum(x>=8 for x in p)/8,0.5,0.5))
+    for part in quarters:
+        add(centered(sum(part)/max(1,len(part)),7.5,5.0))
+    for part in quarters:
+        add(centered(sum(x>=8 for x in part)/max(1,len(part)),0.5,0.5))
     groups.append(sig[-8:])
 
     # G2 · parity / transitions (8)
-    for i in range(4):
-        p=nib[i*8:(i+1)*8]
-        add(centered(sum((x&1)==0 for x in p)/8,0.5,0.5))
+    for part in quarters:
+        add(centered(sum((x&1)==0 for x in part)/max(1,len(part)),0.5,0.5))
     add(transition_score([x>=8 for x in nib]))
     add(transition_score([x&1 for x in nib]))
     add(transition_score(bits))
@@ -102,11 +107,18 @@ def md5_hash64(z):
     groups.append(sig[-8:])
 
     # G3 · shape / symmetry (8)
-    add(centered(sum(nib[:16])/16 - sum(nib[16:])/16,0,5.0))
-    add(centered((sum(nib[:8])+sum(nib[-8:]))/16 - sum(nib[8:24])/16,0,5.0))
-    add(centered(sum(abs(a-b) for a,b in zip(nib,nib[::-1]))/32,5.3,3.5))
-    add(centered(len(set(nib)),12.0,4.0))
-    add(centered(entropy_hex(z),3.72,0.35))
+    half=L//2
+    quarter=L//4
+    add(centered(sum(nib[:half])/half - sum(nib[half:])/half,0,5.0))
+    outer=nib[:quarter]+nib[-quarter:]
+    inner=nib[quarter:-quarter]
+    add(centered(sum(outer)/max(1,len(outer)) - sum(inner)/max(1,len(inner)),0,5.0))
+    add(centered(sum(abs(a-b) for a,b in zip(nib,nib[::-1]))/L,5.3,3.5))
+    # Expected unique hex symbols rises with length; normalize around empirical midpoint.
+    uniq_mid=12.0 if L==32 else 15.0
+    uniq_scale=4.0 if L==32 else 2.0
+    add(centered(len(set(nib)),uniq_mid,uniq_scale))
+    add(centered(entropy_hex(z),3.72 if L==32 else 3.86,0.35 if L==32 else 0.20))
     add(autocorr(nib,1)); add(autocorr(nib,2)); add(autocorr(nib,3))
     groups.append(sig[-8:])
 
@@ -116,12 +128,13 @@ def md5_hash64(z):
     for b in bs: xor ^= b
     add(centered(total%16,7.5,7.5))
     add(centered(xor%16,7.5,7.5))
-    add(centered(int(z[:8],16)%97,48,48))
-    add(centered(int(z[-8:],16)%97,48,48))
-    add(centered(int(z[8:16],16)%89,44,44))
-    add(centered(int(z[16:24],16)%89,44,44))
-    add(centered(sum(nib[::2])/16,7.5,5.0))
-    add(centered(sum(nib[1::2])/16,7.5,5.0))
+    # Four 1/4-width windows, normalized by modular arithmetic.
+    chunks=[z[i*q:(i+1)*q] if i<3 else z[i*q:] for i in range(4)]
+    mods=(97,89,83,79)
+    for ch,m in zip(chunks,mods):
+        add(centered(int(ch,16)%m,(m-1)/2,(m-1)/2))
+    add(centered(sum(nib[::2])/max(1,len(nib[::2])),7.5,5.0))
+    add(centered(sum(nib[1::2])/max(1,len(nib[1::2])),7.5,5.0))
     groups.append(sig[-8:])
 
     # G5 · SHA256 derived (8)
@@ -151,16 +164,17 @@ def md5_hash64(z):
     add(centered(crc%257,128,128))
     add(centered(ad%257,128,128))
     weights=[1,3,5,7,11,13,17,19]
-    add(centered(sum(nib[i]*weights[i%8] for i in range(32))%251,125,125))
-    add(centered(sum(nib[31-i]*weights[i%8] for i in range(32))%251,125,125))
-    primes=[2,3,5,7,11,13,17,19,23,29,31]
-    add(centered(sum(nib[i] for i in primes)/len(primes),7.5,5.0))
-    fib=[0,1,2,3,5,8,13,21]
-    add(centered(sum(nib[i] for i in fib)/len(fib),7.5,5.0))
-    pairxor=[nib[i]^nib[i+1] for i in range(0,32,2)]
-    add(centered(sum(pairxor)/len(pairxor),7.5,5.0))
-    rotxor=[nib[i]^nib[(i+7)%32] for i in range(32)]
-    add(centered(sum(rotxor)/32,7.5,5.0))
+    add(centered(sum(nib[i]*weights[i%8] for i in range(L))%251,125,125))
+    add(centered(sum(nib[L-1-i]*weights[i%8] for i in range(L))%251,125,125))
+    primes=[i for i in (2,3,5,7,11,13,17,19,23,29,31,37,41,43,47,53,59,61) if i<L]
+    add(centered(sum(nib[i] for i in primes)/max(1,len(primes)),7.5,5.0))
+    fib=[i for i in (0,1,2,3,5,8,13,21,34,55) if i<L]
+    add(centered(sum(nib[i] for i in fib)/max(1,len(fib)),7.5,5.0))
+    pairxor=[nib[i]^nib[i+1] for i in range(0,L-1,2)]
+    add(centered(sum(pairxor)/max(1,len(pairxor)),7.5,5.0))
+    lag=7 if L==32 else 13
+    rotxor=[nib[i]^nib[(i+lag)%L] for i in range(L)]
+    add(centered(sum(rotxor)/L,7.5,5.0))
     groups.append(sig[-8:])
 
     # Robust ensemble: each family gets equal weight so correlated features do not dominate.
@@ -178,7 +192,7 @@ def md5_hash64(z):
     active=positive+negative
     consensus=max(positive,negative)/active if active else .5
 
-    # Dead-zone avoids the old one-sided >= .5 tie bias.
+    # Dead-zone avoids one-sided >= .5 tie bias.
     if abs(raw)<0.007:
         tie=hashlib.blake2b(z.encode(),digest_size=1).digest()[0]&1
         raw=0.0075 if tie else -0.0075
@@ -202,16 +216,17 @@ def md5_hash64(z):
         'level':level,
         'models':64,
         'raw':raw,
+        'hash_type':'MD5' if L==32 else 'SHA256',
     }
 
 
-def analyze_md5(z):
+def analyze_hash(z):
     z=z.lower()
     hit=_CACHE.get(z)
     if hit is not None:
         _CACHE.move_to_end(z)
         return dict(hit)
-    r=md5_hash64(z)
+    r=hash_signal64(z)
     _CACHE[z]=dict(r)
     if len(_CACHE)>CACHE_MAX:
         _CACHE.popitem(last=False)
@@ -222,11 +237,12 @@ def format_result(z,r):
     short=f'{z[:8]}…{z[-8:]}'
     return (
         f'<b>⚡ {BOT_NAME}</b>\n'
+        f'🔐 <b>{r["hash_type"]}</b> · HASH-{r["models"]}\n'
         f'<code>{short}</code>\n'
         f'━━━━━━━━━━━━━━━━━━\n'
         f'🎯 <b>{r["prediction"]} · {r["level"]}</b>\n'
         f'⚖️ TÀI <b>{r["tai_pct"]:.2f}%</b>  •  XỈU <b>{r["xiu_pct"]:.2f}%</b>\n'
-        f'🧠 Đồng thuận <b>{r["consensus"]:.1f}%</b> · HASH-{r["models"]}\n'
+        f'🧠 Đồng thuận <b>{r["consensus"]:.1f}%</b>\n'
         f'<i>Độ nghiêng thống kê, không phải xác suất chắc thắng.</i>'
     )
 
@@ -252,14 +268,14 @@ def start_text():
     return (
         f'<b>⚡ {BOT_NAME}</b>\n'
         '━━━━━━━━━━━━━━━━━━\n'
-        '<b>MD5 ANALYZER · HASH-64</b>\n\n'
-        'Gửi trực tiếp <b>MD5 32 ký tự</b>.\n'
-        'Bot tự nhận mã và trả kết quả ngay.\n\n'
+        '<b>MD5 + SHA256 ANALYZER · HASH-64</b>\n\n'
+        'Gửi trực tiếp <b>MD5 32 ký tự</b> hoặc <b>SHA256 64 ký tự</b>.\n'
+        'Bot tự nhận loại hash và trả kết quả ngay.\n\n'
         '• Không cần lệnh phân tích\n'
         '• Hoạt động private + group\n'
-        '• Group sẽ reply đúng tin nhắn chứa MD5\n'
+        '• Group sẽ reply đúng tin nhắn chứa hash\n'
         '• Hash khác định dạng sẽ bỏ qua\n\n'
-        '<i>MD5 là hàm băm một chiều; khi không có quy tắc ánh xạ công khai, kết quả chỉ là phân tích tín hiệu thống kê.</i>'
+        '<i>MD5/SHA256 là hàm băm một chiều; khi không có quy tắc ánh xạ công khai, kết quả chỉ là phân tích tín hiệu thống kê.</i>'
     )
 
 
@@ -278,16 +294,20 @@ async def handle_message(client,msg):
         await tg(client,'sendMessage',reply_payload(chat_id,start_text(),msg if ctype!='private' else None));return
     if text.startswith('/stats') and actor in ADMIN_IDS:
         up=int(time.time()-_STATS['started'])
-        out=(f'<b>📊 MD5 BOT</b>\nPhân tích: <b>{_STATS["total"]}</b>\n'
+        out=(f'<b>📊 HASH BOT</b>\nPhân tích: <b>{_STATS["total"]}</b>\n'
+             f'MD5: {_STATS["md5"]} · SHA256: {_STATS["sha256"]}\n'
              f'Private: {_STATS["private"]} · Group: {_STATS["group"]}\nUptime: {up//3600}h {(up%3600)//60}m')
         await tg(client,'sendMessage',reply_payload(chat_id,out));return
 
-    # Only MD5. Ignore all other ordinary messages.
-    if not MD5_RE.fullmatch(text):
+    # Auto-detect MD5 (32 hex) or SHA256 (64 hex). Ignore other ordinary messages.
+    is_md5=bool(MD5_RE.fullmatch(text))
+    is_sha256=bool(SHA256_RE.fullmatch(text))
+    if not (is_md5 or is_sha256):
         return
 
-    r=analyze_md5(text)
-    _STATS['total']+=1;_STATS['md5']+=1
+    r=analyze_hash(text)
+    _STATS['total']+=1
+    _STATS['md5' if is_md5 else 'sha256']+=1
     _STATS['group' if ctype!='private' else 'private']+=1
     await tg(client,'sendMessage',reply_payload(chat_id,format_result(text.lower(),r),msg if ctype!='private' else None))
 
@@ -309,13 +329,13 @@ async def main_async():
     async with httpx.AsyncClient(limits=limits,timeout=timeout) as client:
         await tg(client,'deleteWebhook',{'drop_pending_updates':False})
         await tg(client,'setMyName',{'name':BOT_NAME})
-        await tg(client,'setMyShortDescription',{'short_description':'⚡ MD5 HASH-64 · phản hồi nhanh · DEVELOPER THANHTUNG VIP'})
-        await tg(client,'setMyDescription',{'description':'MD5-only analyzer · HASH-64 debiased · private & group.'})
+        await tg(client,'setMyShortDescription',{'short_description':'⚡ MD5 + SHA256 · HASH-64 · phản hồi nhanh'})
+        await tg(client,'setMyDescription',{'description':'MD5 + SHA256 analyzer · auto detect · HASH-64 debiased · private & group.'})
         await tg(client,'setMyCommands',{'commands':[
-            {'command':'start','description':'Mở hướng dẫn MD5'},
+            {'command':'start','description':'Hướng dẫn MD5 + SHA256'},
             {'command':'help','description':'Cách sử dụng'}
         ]})
-        print(f'⚡ {BOT_NAME} · MD5-only HASH-64 started')
+        print(f'⚡ {BOT_NAME} · MD5 + SHA256 HASH-64 started')
         offset=0
         tasks=set()
         while True:
