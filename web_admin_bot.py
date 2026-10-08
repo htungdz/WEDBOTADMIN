@@ -272,6 +272,16 @@ def load_seq(con,board,limit=1400):
     return [r['result'] for r in reversed(rows)]
 
 
+def load_history_context(con,board,limit=1400):
+    rows=con.execute('SELECT result,meta_json FROM rounds WHERE board=? ORDER BY id DESC LIMIT ?',(board,limit)).fetchall()
+    rows=list(reversed(rows));seq=[];metas=[]
+    for r in rows:
+        seq.append(r['result'])
+        try: metas.append(json.loads(r['meta_json'] or '{}'))
+        except Exception: metas.append({})
+    return seq,metas
+
+
 def perf_map(con,board):
     # All-time + recent + class-balanced stats. Recent window reacts to regime changes;
     # class stats reduce one-sided strategies from dominating on imbalanced runs.
@@ -308,7 +318,7 @@ def perf_map(con,board):
 
 def memory_signal(con,board,seq):
     best=None
-    for k in range(min(8,len(seq)),1,-1):
+    for k in range(min(12,len(seq)),1,-1):
         pat=''.join('T' if x=='TÀI' else 'X' for x in seq[-k:])
         r=con.execute('SELECT tai_count,xiu_count,samples FROM pattern_memory WHERE board=? AND length=? AND pattern=?',(board,k,pat)).fetchone()
         if not r: continue
@@ -323,7 +333,7 @@ def memory_signal(con,board,seq):
 
 
 def update_pattern_memory(con,board,seq,actual,ts):
-    for k in range(2,min(8,len(seq))+1):
+    for k in range(2,min(12,len(seq))+1):
         pat=''.join('T' if x=='TÀI' else 'X' for x in seq[-k:])
         t=1 if actual=='TÀI' else 0;x=1-t
         con.execute('''
@@ -337,14 +347,14 @@ def update_pattern_memory(con,board,seq,actual,ts):
         ''',(board,k,pat,t,x,1,ts))
 
 
-def create_current_prediction(con,board,seq):
+def create_current_prediction(con,board,seq,meta_history=None):
     if len(seq)<6: return None
     perf=perf_map(con,board);mem=memory_signal(con,board,seq)
-    e=ensemble_prediction(seq,perf=perf,memory=mem,board=board)
+    e=ensemble_prediction(seq,perf=perf,memory=mem,board=board,meta_history=meta_history)
     d={'board':board,'prediction':e['prediction'],'confidence':e['confidence'],
        'agreement':round(e['agreement']*100,1),'source_len':len(seq),
        'strategy_count':e.get('strategy_count',len(STRATEGY_NAMES)),'memory':e.get('memory'),
-       'engine':e.get('engine','ULTRA-79'),'regime':e.get('regime','MIXED'),'edge':e.get('edge',0),
+       'engine':e.get('engine','OMNI-MAX'),'regime':e.get('regime','MIXED'),'edge':e.get('edge',0),
        'top':e.get('top',[])[:8],'updated_at':time.time()}
     con.execute('''
       INSERT INTO current_prediction(board,prediction,confidence,agreement,source_len,details_json,updated_at)
@@ -361,27 +371,35 @@ def learn_rows(board,rows):
     if not rows: return 0
     now=time.time();new_count=0
     with db() as con:
-        seq=load_seq(con,board)
+        seq,meta_history=load_history_context(con,board)
         existing={r['external_key'] for r in con.execute('SELECT external_key FROM rounds WHERE board=?',(board,))}
         perf=perf_map(con,board)
+        pending=[item for item in rows if item.get('result') in ('TÀI','XỈU') and str(item.get('key')) not in existing]
+        cold_skip=max(0,len(pending)-72) if not seq else 0
+        pending_i=0
         for item in rows:
             key=str(item.get('key'));actual=item.get('result')
             if actual not in ('TÀI','XỈU') or key in existing: continue
-            if len(seq)>=12:
+            do_eval=(pending_i>=cold_skip)
+            pending_i+=1
+            if len(seq)>=12 and do_eval:
                 mem=memory_signal(con,board,seq)
-                main=ensemble_prediction(seq,perf=perf,memory=mem,board=board)
-                preds=main.get('strategies') or strategy_predictions(seq,board)
+                main=ensemble_prediction(seq,perf=perf,memory=mem,board=board,meta_history=meta_history)
+                preds=main.get('strategies') or strategy_predictions(seq,board,meta_history)
+                logs=[]
                 for name,pred in preds.items():
                     ok=1 if pred==actual else 0
-                    con.execute('INSERT OR IGNORE INTO strategy_log(board,external_key,strategy,prediction,actual,ok,created_at) VALUES(?,?,?,?,?,?,?)',(board,key,name,pred,actual,ok,now))
+                    logs.append((board,key,name,pred,actual,ok,now))
                     st=perf.setdefault(name,{'n':0,'wins':0});st['n']+=1;st['wins']+=ok
+                if logs:
+                    con.executemany('INSERT OR IGNORE INTO strategy_log(board,external_key,strategy,prediction,actual,ok,created_at) VALUES(?,?,?,?,?,?,?)',logs)
                 con.execute('INSERT OR IGNORE INTO prediction_log(board,external_key,prediction,confidence,actual,ok,agreement,memory_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)',
                             (board,key,main['prediction'],float(main['confidence']),actual,1 if main['prediction']==actual else 0,float(main.get('agreement',.5))*100,
                              json.dumps(main.get('memory'),ensure_ascii=False,separators=(',',':')) if main.get('memory') else None,now))
             update_pattern_memory(con,board,seq,actual,now)
             con.execute('INSERT INTO rounds(board,external_key,result,meta_json,seen_at) VALUES(?,?,?,?,?)',(board,key,actual,json.dumps(item.get('meta') or {},ensure_ascii=False,separators=(',',':')),now))
-            existing.add(key);seq.append(actual);new_count+=1
-        create_current_prediction(con,board,seq);con.commit()
+            existing.add(key);seq.append(actual);meta_history.append(item.get('meta') or {});new_count+=1
+        create_current_prediction(con,board,seq,meta_history);con.commit()
     return new_count
 
 
@@ -416,7 +434,7 @@ def summary_payload():
     with LOCK:st=dict(LEARN_STATUS)
     return {'ok':True,'rounds':rounds,'boards':boards,'patterns':patterns,'mature_patterns':mature,'pattern_samples':sample,
             'settled_predictions':sn,'wins':sw,'win_rate':round(sw/sn*100,2) if sn else None,'strategies':strategies,
-            'engine':f'{len(STRATEGY_NAMES)} strategy ULTRA + live pattern memory','learner':st}
+            'engine':f'{len(STRATEGY_NAMES)} strategy catalog OMNI-MAX + live pattern memory 2-12','learner':st}
 
 
 def board_rows_payload():
@@ -463,7 +481,7 @@ def prediction_payload(board):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version='ThanhtungLearning/3.0-ULTRA79'
+    server_version='ThanhtungLearning/4.0-OMNIMAX'
     def log_message(self,fmt,*args): return
     def send_bytes(self,code,body,ctype='application/json; charset=utf-8'):
         self.send_response(code);self.send_header('Content-Type',ctype);self.send_header('Content-Length',str(len(body)))
@@ -472,7 +490,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self): self.send_bytes(204,b'','text/plain')
     def do_GET(self):
         u=urlparse(self.path);path=u.path.rstrip('/') or '/';qs=parse_qs(u.query)
-        if path=='/':return self.send_bytes(200,json_bytes({'ok':True,'service':'DEVELOPER THANHTUNG VIP BACKEND','mode':'24/7 learner','engine':f'{len(STRATEGY_NAMES)} strategy ULTRA + pattern memory','web':'host index externally'}))
+        if path=='/':return self.send_bytes(200,json_bytes({'ok':True,'service':'DEVELOPER THANHTUNG VIP BACKEND','mode':'24/7 learner','engine':f'OMNI-MAX · {len(STRATEGY_NAMES)} strategy catalog + pattern memory 2-12','web':'host index externally'}))
         if path=='/config':return self.send_bytes(200,json_bytes({'ok':True,**public_config()}))
         if path=='/api/sun/current':
             c=cache_public('sun_current');return self.send_bytes(200 if c.get('ok') else 503,json_bytes(c))
@@ -553,7 +571,7 @@ def admin_keyboard():
 def admin_home():
     s=summary_payload();rate='—' if s['win_rate'] is None else f"{s['win_rate']}%"
     return (f'<b>⚙️ DEVELOPER THANHTUNG VIP · ADMIN</b>\n━━━━━━━━━━━━━━━━━━\n'
-            f'🧠 Engine: <b>79 strategy + Live Memory</b>\n📚 Phiên đã học: <b>{s["rounds"]}</b>\n'
+            f'🧠 Engine: <b>OMNI-MAX · {len(STRATEGY_NAMES)} strategy catalog</b>\n📚 Phiên đã học: <b>{s["rounds"]}</b>\n'
             f'〽️ Cầu/mẫu đã học: <b>{s["patterns"]}</b> · chín {s["mature_patterns"]}\n'
             f'🎯 Backtest causal: <b>{s["settled_predictions"]}</b> · {rate}\n🎮 Bàn: <b>{s["boards"]}</b>\n\n'
             'Backend học 24/7 kể cả khi không ai mở web.')
