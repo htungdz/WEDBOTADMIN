@@ -1,4 +1,4 @@
-# DEVELOPER THANHTUNG VIP · ONLINE LEARNING ENGINE
+# DEVELOPER THANHTUNG · ONLINE LEARNING ENGINE
 # 67 causal binary-sequence strategies consolidated from the V49/V55/V56 engines.
 # TÀI/XỈU are internal binary labels; callers may map Banker/Player to them.
 import math
@@ -1563,27 +1563,36 @@ def strategy_predictions(seq, board=None):
     return {name:out.get(name,raw) for name in STRATEGY_NAMES}
 
 
-def _adaptive_weight(st):
+def _adaptive_weight(st, pred=None):
     st=st or {}
     n=max(0,int(st.get('n',0) or 0)); wins=max(0,min(int(st.get('wins',0) or 0),n))
     rn=max(0,int(st.get('recent_n',0) or 0)); rw=max(0,min(int(st.get('recent_wins',0) or 0),rn))
+    r20n=max(0,int(st.get('recent20_n',0) or 0)); r20w=max(0,min(int(st.get('recent20_wins',0) or 0),r20n))
+    r60n=max(0,int(st.get('recent60_n',0) or 0)); r60w=max(0,min(int(st.get('recent60_wins',0) or 0),r60n))
     tn=max(0,int(st.get('tai_n',0) or 0)); tw=max(0,min(int(st.get('tai_wins',0) or 0),tn))
     xn=max(0,int(st.get('xiu_n',0) or 0)); xw=max(0,min(int(st.get('xiu_wins',0) or 0),xn))
     global_rate=(wins+10.0)/(n+20.0)
     recent_rate=(rw+5.0)/(rn+10.0) if rn else .5
-    if tn and xn:
-        tai_rate=(tw+4.0)/(tn+8.0); xiu_rate=(xw+4.0)/(xn+8.0)
-        balanced=(tai_rate+xiu_rate)/2.0
-    else:
-        balanced=global_rate
-    quality=.38*global_rate+.37*recent_rate+.25*balanced
-    maturity=min(1.0,n/120.0)
-    recent_maturity=min(1.0,rn/60.0)
-    evidence=.55*maturity+.45*recent_maturity
-    # Bad/unstable strategies are actually down-weighted; no early strategy can dominate.
-    weight=.52 + evidence*_clamp((quality-.43)*3.0, -.30, 1.18)
-    return _clamp(weight,.30,1.70), quality, balanced, recent_rate
-
+    r20=(r20w+3.0)/(r20n+6.0) if r20n else .5
+    r60=(r60w+4.0)/(r60n+8.0) if r60n else .5
+    tai_rate=(tw+4.0)/(tn+8.0) if tn else global_rate
+    xiu_rate=(xw+4.0)/(xn+8.0) if xn else global_rate
+    balanced=(tai_rate+xiu_rate)/2.0 if (tn and xn) else global_rate
+    directional=tai_rate if pred=='TÀI' else xiu_rate if pred=='XỈU' else balanced
+    # Heavier recency + directional skill. This reacts faster to a strategy going cold.
+    quality=.20*global_rate+.24*r60+.28*r20+.18*balanced+.10*directional
+    maturity=min(1.0,n/100.0); recent_maturity=min(1.0,(r20n+r60n)/80.0)
+    evidence=.46*maturity+.54*recent_maturity
+    weight=.46 + evidence*_clamp((quality-.43)*3.4,-.38,1.28)
+    # Strongly suppress cold strategies; reward genuinely hot recent performance modestly.
+    if r20n>=10:
+        if r20<.42: weight*=.62
+        elif r20<.47: weight*=.80
+        elif r20>.62: weight*=1.10
+    if pred in ('TÀI','XỈU') and ((pred=='TÀI' and tn>=10) or (pred=='XỈU' and xn>=10)):
+        if directional<.44: weight*=.74
+        elif directional>.60: weight*=1.07
+    return _clamp(weight,.18,1.82), quality, balanced, r20
 
 def _regime_name(seq):
     if not seq:
@@ -1612,7 +1621,7 @@ def ensemble_prediction(seq, perf=None, memory=None, board=None):
     score={'TÀI':0.0,'XỈU':0.0}; rows=[]
     for name,pred in preds.items():
         st=perf.get(name) or {}
-        w,q,bacc,rr=_adaptive_weight(st)
+        w,q,bacc,rr=_adaptive_weight(st,pred)
         score[pred]+=w
         n=int(st.get('n',0) or 0); wins=int(st.get('wins',0) or 0)
         rows.append({'name':name,'prediction':pred,'n':n,'wins':wins,
@@ -2069,7 +2078,7 @@ def ensemble_prediction(seq, perf=None, memory=None, board=None, meta_history=No
     score={'TÀI':0.0,'XỈU':0.0}; rows=[]
     generic_set=set(_BASE79_NAMES)
     for name,pred in preds.items():
-        st=perf.get(name) or {}; w,q,bacc,rr=_adaptive_weight(st)
+        st=perf.get(name) or {}; w,q,bacc,rr=_adaptive_weight(st,pred)
         # New experts start slightly conservative until walk-forward evidence arrives.
         if name not in generic_set and int(st.get('n',0) or 0)<30:w*=.82
         score[pred]+=w
@@ -2097,4 +2106,247 @@ def ensemble_prediction(seq, perf=None, memory=None, board=None, meta_history=No
     rows.sort(key=lambda r:(r['weight'],r['recent'],r['balanced'],r['n']),reverse=True)
     return {'prediction':pred,'confidence':round(conf,2),'agreement':round(agree,4),'strategies':preds,
             'top':rows[:14],'memory':mem,'strategy_count':len(preds),'strategy_catalog':len(STRATEGY_NAMES),
-            'engine':'OMNI-MAX','regime':regime,'edge':round(edge,4)}
+            'engine':'OMNI-MAX FORCE','regime':regime,'edge':round(edge,4)}
+
+
+# ================================================================
+# SUPER-FAMILY ENSEMBLE V2
+# Adds causal experts + family-balanced voting so correlated variants
+# cannot dominate the final direction merely by being numerous.
+# ================================================================
+_FORCE_STRATEGY_NAMES = tuple(STRATEGY_NAMES)
+_force_strategy_predictions = strategy_predictions
+_force_ensemble_prediction = ensemble_prediction
+
+_SUPER12 = (
+    'RECENT_MICRO_MARKOV','RECENCY_TRANSITION_STACK','RUN_TRANSITION_MATRIX',
+    'BAYES_REGIME_MIX','EDGE_REVERSAL_GUARD','FAMILY_CONSENSUS',
+    'SUN_SUM_MARKOV','SUN_TOTAL_DISTANCE_11','SUN_DICE_PARITY_FLOW',
+    'BCR_STREAK_TRANSITION','BCR_ALTERNATION_RATE','BCR_ROAD_PAIR_STATE'
+)
+STRATEGY_NAMES = tuple(dict.fromkeys(_FORCE_STRATEGY_NAMES + _SUPER12))
+
+
+def _recent_micro_markov(seq):
+    q=seq[-56:]
+    if len(q)<10:return _markov_prediction(seq,1)
+    votes=[]
+    for order in (1,2,3):
+        votes.append(_generic_markov(q,order,True))
+    return 'TÀI' if votes.count('TÀI')>=2 else 'XỈU'
+
+
+def _recency_transition_stack(seq):
+    if len(seq)<12:return _markov_prediction(seq,1)
+    votes=[_decayed_transition_prediction(seq,o,d) for o,d in ((1,.975),(2,.968),(3,.960),(4,.952))]
+    return 'TÀI' if votes.count('TÀI')>=2 else 'XỈU'
+
+
+def _run_transition_matrix(seq):
+    if len(seq)<16:return _run_hazard_prediction(seq)
+    cur_side=seq[-1];cur=min(_run_len(seq),8)
+    follow=breaks=1.0
+    for i in range(2,len(seq)):
+        side=seq[i-1]
+        rl=1;j=i-2
+        while j>=0 and seq[j]==side and rl<8:
+            rl+=1;j-=1
+        if side!=cur_side or abs(rl-cur)>1:continue
+        w=.972**(len(seq)-1-i)
+        if seq[i]==side:follow+=w
+        else:breaks+=w
+    return cur_side if follow>=breaks else _opp(cur_side)
+
+
+def _bayes_regime_mix(seq):
+    q=seq[-64:]
+    if len(q)<12:return _beta_posterior_prediction(seq)
+    p=(q.count('TÀI')+2)/(len(q)+4)
+    regime=_regime_name(seq)
+    if regime=='TREND':
+        return 'TÀI' if p>=.5 else 'XỈU'
+    if regime=='NOISY':
+        return _generic_markov(seq,2,True)
+    return _beta_posterior_prediction(seq)
+
+
+def _edge_reversal_guard(seq):
+    if len(seq)<18:return _decayed_transition_prediction(seq,2)
+    a=seq[-8:];b=seq[-18:-8]
+    pa=a.count('TÀI')/len(a);pb=b.count('TÀI')/len(b)
+    drift=pa-pb
+    if abs(drift)>=.27:
+        return 'TÀI' if drift>0 else 'XỈU'
+    return _three_window_confirm_prediction(seq)
+
+
+def _family_consensus_from(preds,seq):
+    if not preds:return _markov_prediction(seq,1)
+    fam={}
+    for n,p in preds.items():
+        u=n.upper()
+        if any(x in u for x in ('MARKOV','CONTEXT','NGRAM','VOM','SUFFIX','TRANSITION')):f='CTX'
+        elif any(x in u for x in ('MOTIF','KNN','ANALOG','PATTERN','CYCLE','AUTOCORR')):f='PATTERN'
+        elif any(x in u for x in ('RUN','STREAK','DRAGON','HAZARD','PING','RLE')):f='RUN'
+        elif any(x in u for x in ('BAYES','EWMA','LMS','WILSON','POSTERIOR','ENTROPY')):f='STAT'
+        elif any(x in u for x in ('GUARD','REGIME','DRIFT','CHANGE','HORIZON','STABILITY')):f='REGIME'
+        elif u.startswith('SUN_'):f='SUN'
+        elif u.startswith('BCR_'):f='BCR'
+        else:f='OTHER'
+        z=fam.setdefault(f,{'TÀI':0,'XỈU':0});z[p]=z.get(p,0)+1
+    fv=[]
+    for z in fam.values():fv.append('TÀI' if z.get('TÀI',0)>=z.get('XỈU',0) else 'XỈU')
+    return 'TÀI' if fv.count('TÀI')>=fv.count('XỈU') else 'XỈU'
+
+
+def _sun_meta(meta_history):
+    out=[]
+    for m in (meta_history or []):
+        if not isinstance(m,dict):continue
+        try:tot=int(m.get('total'))
+        except Exception:continue
+        dice=m.get('dice') or []
+        out.append((tot,dice))
+    return out
+
+
+def _sun_sum_markov(seq,meta_history):
+    m=_sun_meta(meta_history)
+    if len(m)<14:return _sun_total_11(seq,meta_history)
+    bucket=lambda t:'L' if t<=8 else 'M' if t<=12 else 'H'
+    cur=bucket(m[-1][0]);c={'TÀI':1.0,'XỈU':1.0}
+    for i in range(1,min(len(m),len(seq))):
+        if bucket(m[i-1][0])==cur:
+            c[seq[i]]+=.97**(len(seq)-1-i)
+    return 'TÀI' if c['TÀI']>=c['XỈU'] else 'XỈU'
+
+
+def _sun_total_distance_11(seq,meta_history):
+    m=_sun_meta(meta_history)
+    if len(m)<8:return _sun_total_11(seq,meta_history)
+    vals=[t for t,_ in m[-18:]]
+    avg=sum(vals)/len(vals);recent=vals[-1]
+    # Momentum toward/away from the 10.5 boundary, combined with mean reversion.
+    v=(recent-10.5)*.55+(avg-10.5)*.45
+    return 'TÀI' if v>=0 else 'XỈU'
+
+
+def _sun_dice_parity_flow(seq,meta_history):
+    m=_sun_meta(meta_history)
+    if len(m)<10:return _sun_dice_position(seq,meta_history)
+    score=0.0
+    for age,(tot,dice) in enumerate(reversed(m[-20:])):
+        if len(dice)==3:
+            odd=sum(int(x)%2 for x in dice);w=.94**age
+            score += w*(1 if odd>=2 else -1)
+    return 'TÀI' if score>=0 else 'XỈU'
+
+
+def _bcr_streak_transition(seq):
+    return _run_transition_matrix(seq)
+
+
+def _bcr_alternation_rate(seq):
+    q=seq[-30:]
+    if len(q)<8:return _flip_state_markov_prediction(seq)
+    alt=sum(1 for i in range(1,len(q)) if q[i]!=q[i-1])/max(1,len(q)-1)
+    if alt>=.62:return _opp(q[-1])
+    if alt<=.34:return q[-1]
+    return _generic_markov(seq,2,True)
+
+
+def _bcr_road_pair_state(seq):
+    if len(seq)<12:return _pair_state_prediction(seq)
+    key=tuple(seq[-2:]);c={'TÀI':1.0,'XỈU':1.0}
+    for i in range(2,len(seq)):
+        if tuple(seq[i-2:i])==key:
+            c[seq[i]]+=.968**(len(seq)-1-i)
+    return 'TÀI' if c['TÀI']>=c['XỈU'] else 'XỈU'
+
+
+def strategy_predictions(seq, board=None, meta_history=None):
+    seq=[x for x in seq if x in ('TÀI','XỈU')]
+    if not seq:return {}
+    out=dict(_force_strategy_predictions(seq,board,meta_history))
+    base_snapshot=dict(out)
+    out.update({
+        'RECENT_MICRO_MARKOV':_recent_micro_markov(seq),
+        'RECENCY_TRANSITION_STACK':_recency_transition_stack(seq),
+        'RUN_TRANSITION_MATRIX':_run_transition_matrix(seq),
+        'BAYES_REGIME_MIX':_bayes_regime_mix(seq),
+        'EDGE_REVERSAL_GUARD':_edge_reversal_guard(seq),
+        'FAMILY_CONSENSUS':_family_consensus_from(base_snapshot,seq),
+    })
+    b=str(board or '').lower()
+    if b.startswith('sunwin:'):
+        out.update({'SUN_SUM_MARKOV':_sun_sum_markov(seq,meta_history),
+                    'SUN_TOTAL_DISTANCE_11':_sun_total_distance_11(seq,meta_history),
+                    'SUN_DICE_PARITY_FLOW':_sun_dice_parity_flow(seq,meta_history)})
+    elif b.startswith('baccarat:'):
+        out.update({'BCR_STREAK_TRANSITION':_bcr_streak_transition(seq),
+                    'BCR_ALTERNATION_RATE':_bcr_alternation_rate(seq),
+                    'BCR_ROAD_PAIR_STATE':_bcr_road_pair_state(seq)})
+    return out
+
+
+def _family_name(name):
+    u=name.upper()
+    if u.startswith('SUN_'):return 'SUN_SPECIAL'
+    if u.startswith('BCR_'):return 'BCR_SPECIAL'
+    if any(x in u for x in ('MARKOV','CONTEXT','NGRAM','VOM','SUFFIX','TRANSITION','CTW')):return 'CONTEXT'
+    if any(x in u for x in ('MOTIF','KNN','ANALOG','PATTERN','CYCLE','AUTOCORR','PERIOD')):return 'PATTERN'
+    if any(x in u for x in ('RUN','STREAK','DRAGON','HAZARD','PING','RLE')):return 'RUN'
+    if any(x in u for x in ('BAYES','EWMA','LMS','WILSON','POSTERIOR','ENTROPY','MOMENTUM')):return 'STAT'
+    if any(x in u for x in ('GUARD','REGIME','DRIFT','CHANGE','HORIZON','STABILITY')):return 'REGIME'
+    return 'OTHER'
+
+
+def ensemble_prediction(seq, perf=None, memory=None, board=None, meta_history=None):
+    perf=perf or {};preds=strategy_predictions(seq,board,meta_history)
+    if not preds:
+        return {'prediction':'TÀI','confidence':50.0,'agreement':.5,'strategies':{},'top':[],
+                'strategy_count':0,'strategy_catalog':len(STRATEGY_NAMES),'engine':'OMNI-MAX SUPER'}
+    families={};rows=[]
+    for name,pred in preds.items():
+        st=perf.get(name) or {};w,q,bacc,rr=_adaptive_weight(st,pred)
+        n=int(st.get('n',0) or 0)
+        if n<18:w*=.78
+        elif n<40:w*=.90
+        fam=_family_name(name);f=families.setdefault(fam,{'TÀI':0.0,'XỈU':0.0,'w':0.0,'n':0})
+        f[pred]+=w;f['w']+=w;f['n']+=1
+        rows.append({'name':name,'family':fam,'prediction':pred,'n':n,'wins':int(st.get('wins',0) or 0),
+                     'rate':round(q,4),'balanced':round(bacc,4),'recent':round(rr,4),'weight':round(w,4)})
+    # Family-balanced vote: each family has bounded influence regardless of size.
+    score={'TÀI':0.0,'XỈU':0.0};family_rows=[]
+    for fam,z in families.items():
+        tot=z['TÀI']+z['XỈU']
+        if tot<=0:continue
+        p=z['TÀI']/tot;edge=abs(p-.5)*2
+        fw=.72+min(.78,edge*.9)+min(.28,math.log1p(z['n'])*.06)
+        side='TÀI' if p>=.5 else 'XỈU';score[side]+=fw
+        family_rows.append({'family':fam,'prediction':side,'agreement':round(max(p,1-p),4),'weight':round(fw,4),'experts':z['n']})
+    mem=None
+    if memory:
+        support=int(memory.get('support',0) or 0);p=float(memory.get('p_tai',.5) or .5);me=abs(p-.5)*2
+        if support>=4 and me>=.05:
+            side='TÀI' if p>=.5 else 'XỈU';mw=min(1.35,.25+math.log1p(support)*.16+me*.7)
+            score[side]+=mw;mem={'prediction':side,'weight':round(mw,3),'support':support,'p_tai':round(p,4),
+                                'pattern':memory.get('pattern'),'length':memory.get('length')}
+    total=score['TÀI']+score['XỈU'];pred='TÀI' if score['TÀI']>=score['XỈU'] else 'XỈU';agree=score[pred]/max(total,1e-9)
+    validated=[r for r in rows if r['n']>=24]
+    quality=sum(r['balanced'] for r in validated)/len(validated) if validated else .5
+    edge=abs(score['TÀI']-score['XỈU'])/max(total,1e-9)
+    # Conservative calibration: strength, not promised win probability.
+    conf=50+max(0,agree-.5)*21+max(0,quality-.5)*10+edge*4
+    if len(seq)<30:conf=min(conf,54.0)
+    elif len(seq)<70:conf=min(conf,58.0)
+    elif len(seq)<140:conf=min(conf,62.0)
+    if not validated:conf=min(conf,56.0)
+    regime=_regime_name(seq)
+    if regime=='NOISY':conf=min(conf,61.0)
+    conf=_clamp(conf,50.0,68.0)
+    rows.sort(key=lambda r:(r['weight'],r['recent'],r['balanced'],r['n']),reverse=True)
+    family_rows.sort(key=lambda r:r['weight'],reverse=True)
+    return {'prediction':pred,'confidence':round(conf,2),'agreement':round(agree,4),'strategies':preds,
+            'top':rows[:16],'families':family_rows,'memory':mem,'strategy_count':len(preds),
+            'strategy_catalog':len(STRATEGY_NAMES),'engine':'OMNI-MAX SUPER FAMILY','regime':regime,'edge':round(edge,4)}
