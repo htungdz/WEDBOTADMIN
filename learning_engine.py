@@ -1644,3 +1644,457 @@ def ensemble_prediction(seq, perf=None, memory=None, board=None):
     return {'prediction':pred,'confidence':round(conf,2),'agreement':round(agree,4),
             'strategies':preds,'top':rows[:12],'memory':mem,'strategy_count':len(preds),
             'engine':'ULTRA-79','regime':_regime_name(seq),'edge':round(edge,4)}
+
+
+# ========================= OMNI-MAX CONSOLIDATED HISTORY LAYER =========================
+# Consolidates relevant sequence algorithms requested across prior versions/conversations.
+# Generic sequence experts are shared. SUNWIN/Baccarat-only experts are gated by board type.
+# Confidence remains a calibrated signal-strength score, not a guaranteed win probability.
+_BASE79_NAMES = tuple(STRATEGY_NAMES)
+_base79_strategy_predictions = strategy_predictions
+_base79_ensemble_prediction = ensemble_prediction
+
+
+def _mk01(v):
+    return 1.0 if v == 'TÀI' else -1.0
+
+
+def _generic_markov(seq, order=5, decay=False):
+    if not seq:
+        return 'TÀI'
+    order=max(1,min(int(order),12))
+    if len(seq) <= order+3:
+        return _markov_prediction(seq,min(order,4))
+    ctx=tuple(seq[-order:]); t=x=1.5; n=len(seq)
+    for i in range(order,n):
+        if tuple(seq[i-order:i]) != ctx:
+            continue
+        w=(0.5**((n-1-i)/180.0)) if decay else 1.0
+        if seq[i]=='TÀI': t+=w
+        else: x+=w
+    return 'TÀI' if t>=x else 'XỈU'
+
+
+def _context_2_7_prediction(seq):
+    vals=[]
+    for k in range(2,8):
+        if len(seq)>k+4:
+            vals.append(_generic_markov(seq,k,True))
+    return _majority(vals,_markov_prediction(seq,2))
+
+
+def _ngram_2_9_prediction(seq):
+    if len(seq)<8:
+        return _markov_prediction(seq,2)
+    vt=vx=0.0
+    n=len(seq)
+    for k in range(2,min(9,n-2)+1):
+        ctx=tuple(seq[-k:]); t=x=1.2; sup=0.0
+        for i in range(k,n):
+            if tuple(seq[i-k:i])!=ctx: continue
+            age=n-1-i; w=0.5**(age/max(42.0,150.0-k*7))
+            if seq[i]=='TÀI': t+=w
+            else: x+=w
+            sup+=w
+        if sup<.8: continue
+        edge=(t-x)/(t+x); wt=(.8+.08*k)*(sup/(sup+3.5))
+        if edge>=0: vt+=abs(edge)*wt
+        else: vx+=abs(edge)*wt
+    if vt+vx<.02: return _suffix_prediction(seq)
+    return 'TÀI' if vt>=vx else 'XỈU'
+
+
+def _vom_2_12_prediction(seq):
+    if len(seq)<10: return _markov_prediction(seq,2)
+    vals=[]
+    for k in range(2,min(12,len(seq)-3)+1):
+        vals.append(_generic_markov(seq,k,True))
+    return _majority(vals,_dirichlet_vom_prediction(seq))
+
+
+def _run_lengths(seq, maxn=12):
+    if not seq: return []
+    out=[]; cur=seq[0]; n=1
+    for v in seq[1:]:
+        if v==cur: n+=1
+        else:
+            out.append((cur,min(n,maxn))); cur=v; n=1
+    out.append((cur,min(n,maxn)))
+    return out
+
+
+def _cycle_template_prediction(seq, template):
+    if not seq: return 'TÀI'
+    runs=_run_lengths(seq)
+    if not runs: return seq[-1]
+    lens=[n for _,n in runs]
+    side=seq[-1]; cur=lens[-1]
+    L=len(template)
+    # Determine phase by matching recent completed/current run lengths to cyclic template.
+    best=None
+    for phase in range(L):
+        score=0
+        for j,n in enumerate(lens[-min(len(lens),L*3):]):
+            want=template[(phase-len(lens[-min(len(lens),L*3):])+1+j)%L]
+            score+=abs(n-want)
+        if best is None or score<best[0]: best=(score,phase)
+    target=template[best[1]] if best else template[0]
+    return side if cur<target else _opp(side)
+
+
+def _pattern_11(seq): return _cycle_template_prediction(seq,(1,1))
+def _pattern_21(seq): return _cycle_template_prediction(seq,(2,1))
+def _pattern_22(seq): return _cycle_template_prediction(seq,(2,2))
+def _pattern_321(seq): return _cycle_template_prediction(seq,(3,2,1))
+
+
+def _block_cycle_prediction(seq):
+    n=len(seq)
+    if n<10: return _suffix_prediction(seq)
+    for L in range(min(8,n//2),1,-1):
+        a=seq[-L:]; b=seq[-2*L:-L]
+        if a==b:
+            # repeated block; next side follows first element of block
+            return a[0]
+    return _periodic_match_prediction(seq)
+
+
+def _pair_state_prediction(seq):
+    if len(seq)<10: return _markov_prediction(seq,2)
+    states=[('S' if seq[i]==seq[i-1] else 'F') for i in range(1,len(seq))]
+    if len(states)<4:return _markov_prediction(seq,2)
+    key=tuple(states[-2:]); same=flip=1.0
+    for i in range(2,len(states)):
+        if tuple(states[i-2:i])!=key: continue
+        if states[i]=='S': same+=1
+        else: flip+=1
+    return seq[-1] if same>=flip else _opp(seq[-1])
+
+
+def _triple_state_prediction(seq):
+    if len(seq)<14:return _markov_prediction(seq,3)
+    key=tuple(seq[-3:]); t=x=1.0
+    for i in range(3,len(seq)):
+        if tuple(seq[i-3:i])!=key:continue
+        if seq[i]=='TÀI':t+=1
+        else:x+=1
+    return 'TÀI' if t>=x else 'XỈU'
+
+
+def _rle_1_10_prediction(seq):
+    if len(seq)<12:return _run_hazard_prediction(seq)
+    runs=_run_lengths(seq,10); side=seq[-1]; cur=min(_run_len(seq),10)
+    follow=brk=1.5
+    # historical chance a run of this side survives current length
+    for si,n in runs[:-1]:
+        if si!=side: continue
+        if n>cur: follow+=1
+        elif n==cur: brk+=1
+    return side if follow>=brk else _opp(side)
+
+
+def _autocorr_1_16_prediction(seq):
+    n=len(seq)
+    if n<20:return _periodic_match_prediction(seq)
+    best=None
+    for lag in range(1,min(16,n//3)+1):
+        q=seq[-min(n,160):]
+        same=sum(1 for i in range(lag,len(q)) if q[i]==q[i-lag])
+        tot=max(1,len(q)-lag); rate=same/tot
+        edge=abs(rate-.5)*(tot/(tot+24))
+        if best is None or edge>best[0]:best=(edge,lag,rate)
+    if not best:return _periodic_match_prediction(seq)
+    _,lag,rate=best; candidate=seq[-lag]
+    return candidate if rate>=.5 else _opp(candidate)
+
+
+def _cycle_match_prediction(seq):
+    if len(seq)<24:return _periodic_match_prediction(seq)
+    preds=[_autocorr_1_16_prediction(seq),_spectral_lag_prediction(seq),_periodic_match_prediction(seq),_lag_ensemble_prediction(seq)]
+    return _majority(preds,_periodic_match_prediction(seq))
+
+
+def _multi_horizon_10_20_36_64(seq):
+    vals=[]
+    for w in (10,20,36,64):
+        if len(seq)>=min(w,8):
+            q=seq[-w:]; vals.append('TÀI' if q.count('TÀI')>=q.count('XỈU') else 'XỈU')
+    vals += [_dual_horizon_prediction(seq),_horizon_consensus_prediction(seq)]
+    return _majority(vals,_multi_window_prediction(seq))
+
+
+def _bayes_12_24_48(seq):
+    votes=[]
+    for w in (12,24,48):
+        q=seq[-w:]
+        if len(q)<6:continue
+        # Beta(3,3) posterior on side frequency.
+        pt=(q.count('TÀI')+3)/(len(q)+6)
+        votes.append('TÀI' if pt>=.5 else 'XỈU')
+    votes += [_bayes_context_prediction(seq),_long_memory_bayes_prediction(seq)]
+    return _majority(votes,_bayes_context_prediction(seq))
+
+
+def _ewma_multi_prediction(seq):
+    if not seq:return 'TÀI'
+    votes=[]
+    for alpha in (.12,.20,.32):
+        e=.5
+        for v in seq[-240:]:e=alpha*(1 if v=='TÀI' else 0)+(1-alpha)*e
+        votes.append('TÀI' if e>=.5 else 'XỈU')
+    votes.append(_decayed_transition_prediction(seq,2))
+    return _majority(votes,_multi_window_prediction(seq))
+
+
+def _lms_online_prediction(seq):
+    # Small causal online linear learner over the latest 8 binary lags.
+    if len(seq)<28:return _bayes_context_prediction(seq)
+    k=8; w=[0.0]*k; b=0.0; lr=.045
+    vals=[_mk01(v) for v in seq[-420:]]
+    for i in range(k,len(vals)):
+        x=[vals[i-j-1] for j in range(k)]; y=vals[i]
+        z=b+sum(a*c for a,c in zip(w,x)); pred=max(-1,min(1,z)); err=y-pred
+        step=lr/(1+.0015*i)
+        b+=step*err*.25
+        for j in range(k):w[j]+=step*err*x[j]/k
+    x=[vals[-j-1] for j in range(k)]; z=b+sum(a*c for a,c in zip(w,x))
+    return 'TÀI' if z>=0 else 'XỈU'
+
+
+def _beta_posterior_prediction(seq):
+    if not seq:return 'TÀI'
+    t=x=4.0
+    n=len(seq)
+    for i,v in enumerate(seq[-320:]):
+        age=min(319,n-1-i); wt=0.5**(age/120.0)
+        if v=='TÀI':t+=wt
+        else:x+=wt
+    return 'TÀI' if t>=x else 'XỈU'
+
+
+def _pattern_lock_prediction(seq):
+    pats=[_suffix_prediction(seq),_motif_weighted_prediction(seq),_motif_survival_prediction(seq),_block_cycle_prediction(seq),_context_2_7_prediction(seq)]
+    return _majority(pats,_motif_weighted_prediction(seq))
+
+
+def _consensus_guard_prediction(seq):
+    stable=[_hierarchical_bayes_prediction(seq),_ctw_approx_prediction(seq),_run_hazard_prediction(seq),_motif_weighted_prediction(seq),_multi_horizon_10_20_36_64(seq),_ewma_multi_prediction(seq)]
+    return _majority(stable,_robust_stack_prediction(seq))
+
+
+def _hysteresis_guard_prediction(seq):
+    if not seq:return 'TÀI'
+    base=_consensus_guard_prediction(seq); run=_run_len(seq)
+    # Do not reverse a short stable run unless several reversal experts agree.
+    rev=[_changepoint_adaptive_prediction(seq),_transition_drift_prediction(seq),_entropy_gate_prediction(seq)]
+    rev_side=_opp(seq[-1]); rev_votes=sum(1 for v in rev if v==rev_side)
+    if run<=3 and base==rev_side and rev_votes<2:return seq[-1]
+    return base
+
+
+def _error_invert_guard_prediction(seq):
+    # Causal micro walk-forward: invert the current robust signal only when its recent
+    # one-step behavior has been persistently poor.
+    if len(seq)<45:return _robust_stack_prediction(seq)
+    ok=tot=0
+    start=max(24,len(seq)-14)
+    for i in range(start,len(seq)):
+        q=seq[:i]
+        try:p=_robust_stack_prediction(q)
+        except Exception:continue
+        tot+=1;ok+=int(p==seq[i])
+    cur=_robust_stack_prediction(seq)
+    return _opp(cur) if tot>=8 and ok/tot<.36 else cur
+
+
+def _three_window_confirm_prediction(seq):
+    votes=[]
+    for w in (12,28,60):
+        q=seq[-w:]
+        votes.append(_majority([_generic_markov(q,2,True),_motif_weighted_prediction(q),_run_hazard_prediction(q)],_markov_prediction(q,2)))
+    return _majority(votes,_horizon_consensus_prediction(seq))
+
+
+def _bcr_road_streak(seq):
+    if not seq:return 'TÀI'
+    r=_run_len(seq)
+    if 2<=r<=3:return seq[-1]
+    if 4<=r<=6:return _opp(seq[-1])
+    return _run_hazard_prediction(seq)
+
+
+def _bcr_dragon_break(seq):
+    if not seq:return 'TÀI'
+    r=_run_len(seq)
+    if r>=7:return seq[-1]
+    if r>=4:return _opp(seq[-1])
+    return _run_survival_prediction(seq)
+
+
+def _bcr_hot_zone(seq):
+    if len(seq)<10:return _multi_window_prediction(seq)
+    q12=seq[-12:];q24=seq[-24:]
+    s12=q12.count('TÀI')-q12.count('XỈU');s24=q24.count('TÀI')-q24.count('XỈU')
+    z=1.35*s12+.65*s24
+    return 'TÀI' if z>=0 else 'XỈU'
+
+
+def _bcr_api_road_hint(seq, meta_history=None):
+    if meta_history:
+        for m in reversed(meta_history[-8:]):
+            s=str((m or {}).get('good_road') or '').lower()
+            if not s:continue
+            if ('bệt' in s or 'bet' in s or 'dính' in s or 'dinh' in s):
+                if 'cái' in s or 'cai' in s or 'banker' in s:return 'TÀI'
+                if 'con' in s or 'player' in s:return 'XỈU'
+            if ('đảo' in s or 'dao' in s or 'xen' in s) and seq:return _opp(seq[-1])
+    return _bcr_road_streak(seq)
+
+
+def _valid_sun_metas(meta_history):
+    out=[]
+    for m in meta_history or []:
+        if not isinstance(m,dict):continue
+        dice=m.get('dice') or []
+        total=m.get('total')
+        try: total=int(total) if total is not None else (sum(map(int,dice)) if len(dice)==3 else None)
+        except Exception: total=None
+        try: dice=[int(x) for x in dice] if len(dice)==3 else []
+        except Exception:dice=[]
+        out.append({'total':total,'dice':dice})
+    return out
+
+
+def _sun_total_11(seq,meta_history=None):
+    m=_valid_sun_metas(meta_history)
+    vals=[z['total'] for z in m if isinstance(z.get('total'),int)]
+    if len(vals)<8:return _multi_window_prediction(seq)
+    # Weighted center around the 10/11 boundary plus transition tendency.
+    q=vals[-18:]; center=sum((i+1)*v for i,v in enumerate(q))/sum(range(1,len(q)+1))
+    last=q[-1]; slope=(q[-1]-q[-4])/3 if len(q)>=4 else 0
+    score=(center-10.5)+.20*slope
+    if last>=15:score-=.8
+    elif last<=6:score+=.8
+    return 'TÀI' if score>=0 else 'XỈU'
+
+
+def _sun_dice_position(seq,meta_history=None):
+    m=_valid_sun_metas(meta_history)
+    rows=[z for z in m if len(z.get('dice') or [])==3]
+    if len(rows)<12:return _markov_prediction(seq,2)
+    votes=[]
+    for pos in range(3):
+        cur=rows[-1]['dice'][pos]; t=x=1.0
+        for i in range(1,len(rows)):
+            if rows[i-1]['dice'][pos]!=cur:continue
+            total=rows[i].get('total')
+            if not isinstance(total,int):continue
+            if total>=11:t+=1
+            else:x+=1
+        votes.append('TÀI' if t>=x else 'XỈU')
+    return _majority(votes,_markov_prediction(seq,2))
+
+
+def _sun_total_band_volatility(seq,meta_history=None):
+    m=_valid_sun_metas(meta_history)
+    vals=[z['total'] for z in m if isinstance(z.get('total'),int)]
+    if len(vals)<10:return _multi_window_prediction(seq)
+    q=vals[-16:]; mean=sum(q)/len(q); var=sum((v-mean)**2 for v in q)/len(q); vol=math.sqrt(var)
+    last=q[-1]
+    # high volatility -> mean-reversion; low volatility -> local band persistence
+    if vol>=3.0:
+        return 'XỈU' if last>=12 else 'TÀI' if last<=9 else _multi_window_prediction(seq)
+    recent=sum(q[-5:])/min(5,len(q))
+    return 'TÀI' if recent>=10.5 else 'XỈU'
+
+
+_OMNI32 = (
+    'MARKOV_ORDER4_MAX','MARKOV_ORDER5','CONTEXT_2_7','NGRAM_2_9','VOM_2_12',
+    'PATTERN_1_1','PATTERN_2_1','PATTERN_2_2','PATTERN_3_2_1','BLOCK_CYCLE',
+    'PAIR_STATE','TRIPLE_STATE','RLE_1_10','AUTOCORR_1_16','CYCLE_MATCH',
+    'MULTI_HORIZON_10_20_36_64','BAYES_12_24_48','EWMA_MULTI','LMS_ONLINE',
+    'BETA_POSTERIOR','PATTERN_LOCK','CONSENSUS_GUARD','HYSTERESIS_GUARD',
+    'ERROR_INVERT_GUARD','THREE_WINDOW_CONFIRM','BCR_ROAD_STREAK','BCR_DRAGON_BREAK',
+    'BCR_HOT_ZONE','BCR_API_ROAD_HINT','SUN_TOTAL_11','SUN_DICE_POSITION',
+    'SUN_TOTAL_BAND_VOLATILITY'
+)
+STRATEGY_NAMES = tuple(dict.fromkeys(_BASE79_NAMES + _OMNI32))
+
+
+def strategy_predictions(seq, board=None, meta_history=None):
+    seq=[x for x in seq if x in ('TÀI','XỈU')]
+    if not seq:return {}
+    _old=_base79_strategy_predictions(seq,board)
+    out={k:_old[k] for k in _BASE79_NAMES if k in _old}
+    out.update({
+        'MARKOV_ORDER4_MAX':_generic_markov(seq,4,True),
+        'MARKOV_ORDER5':_generic_markov(seq,5,True),
+        'CONTEXT_2_7':_context_2_7_prediction(seq),
+        'NGRAM_2_9':_ngram_2_9_prediction(seq),
+        'VOM_2_12':_vom_2_12_prediction(seq),
+        'PATTERN_1_1':_pattern_11(seq),'PATTERN_2_1':_pattern_21(seq),
+        'PATTERN_2_2':_pattern_22(seq),'PATTERN_3_2_1':_pattern_321(seq),
+        'BLOCK_CYCLE':_block_cycle_prediction(seq),'PAIR_STATE':_pair_state_prediction(seq),
+        'TRIPLE_STATE':_triple_state_prediction(seq),'RLE_1_10':_rle_1_10_prediction(seq),
+        'AUTOCORR_1_16':_autocorr_1_16_prediction(seq),'CYCLE_MATCH':_cycle_match_prediction(seq),
+        'MULTI_HORIZON_10_20_36_64':_multi_horizon_10_20_36_64(seq),
+        'BAYES_12_24_48':_bayes_12_24_48(seq),'EWMA_MULTI':_ewma_multi_prediction(seq),
+        'LMS_ONLINE':_lms_online_prediction(seq),'BETA_POSTERIOR':_beta_posterior_prediction(seq),
+        'PATTERN_LOCK':_pattern_lock_prediction(seq),'CONSENSUS_GUARD':_consensus_guard_prediction(seq),
+        'HYSTERESIS_GUARD':_hysteresis_guard_prediction(seq),'ERROR_INVERT_GUARD':_error_invert_guard_prediction(seq),
+        'THREE_WINDOW_CONFIRM':_three_window_confirm_prediction(seq),
+    })
+    b=str(board or '').lower()
+    if b.startswith('baccarat:'):
+        out.update({
+            'BCR_ROAD_STREAK':_bcr_road_streak(seq),
+            'BCR_DRAGON_BREAK':_bcr_dragon_break(seq),
+            'BCR_HOT_ZONE':_bcr_hot_zone(seq),
+            'BCR_API_ROAD_HINT':_bcr_api_road_hint(seq,meta_history),
+        })
+    elif b.startswith('sunwin:'):
+        out.update({
+            'SUN_TOTAL_11':_sun_total_11(seq,meta_history),
+            'SUN_DICE_POSITION':_sun_dice_position(seq,meta_history),
+            'SUN_TOTAL_BAND_VOLATILITY':_sun_total_band_volatility(seq,meta_history),
+        })
+    return out
+
+
+def ensemble_prediction(seq, perf=None, memory=None, board=None, meta_history=None):
+    perf=perf or {}; preds=strategy_predictions(seq,board,meta_history)
+    if not preds:
+        return {'prediction':'TÀI','confidence':50.0,'agreement':0.5,'strategies':{},'top':[],
+                'strategy_count':0,'engine':'OMNI-MAX'}
+    score={'TÀI':0.0,'XỈU':0.0}; rows=[]
+    generic_set=set(_BASE79_NAMES)
+    for name,pred in preds.items():
+        st=perf.get(name) or {}; w,q,bacc,rr=_adaptive_weight(st)
+        # New experts start slightly conservative until walk-forward evidence arrives.
+        if name not in generic_set and int(st.get('n',0) or 0)<30:w*=.82
+        score[pred]+=w
+        n=int(st.get('n',0) or 0); wins=int(st.get('wins',0) or 0)
+        rows.append({'name':name,'prediction':pred,'n':n,'wins':wins,
+                     'rate':round(q,4),'balanced':round(bacc,4),'recent':round(rr,4),'weight':round(w,4)})
+    mem=None
+    if memory:
+        support=int(memory.get('support',0) or 0); p=float(memory.get('p_tai',.5) or .5); edge_mem=abs(p-.5)*2
+        if support>=4 and edge_mem>=.05:
+            side='TÀI' if p>=.5 else 'XỈU'; mw=min(2.25,.28+math.log1p(support)*.26+edge_mem*1.25)
+            score[side]+=mw; mem={'prediction':side,'weight':round(mw,3),'support':support,'p_tai':round(p,4),'pattern':memory.get('pattern'),'length':memory.get('length')}
+    total=score['TÀI']+score['XỈU']; pred='TÀI' if score['TÀI']>=score['XỈU'] else 'XỈU'; agree=score[pred]/total if total else .5
+    validated=[r for r in rows if r['n']>=24]; quality=sum(r['rate'] for r in validated)/len(validated) if validated else .5
+    edge=abs(score['TÀI']-score['XỈU'])/max(total,1e-9)
+    # Penalize disagreement/correlation: extra experts cannot mechanically inflate confidence.
+    conf=50+max(0,agree-.5)*25+max(0,quality-.5)*13+edge*3.5
+    if len(seq)<20:conf=min(conf,53.0)
+    elif len(seq)<50:conf=min(conf,57.5)
+    elif len(seq)<100:conf=min(conf,62.0)
+    if not validated:conf=min(conf,57.0)
+    regime=_regime_name(seq)
+    if regime=='NOISY':conf=min(conf,60.5)
+    conf=_clamp(conf,50.0,69.0)
+    rows.sort(key=lambda r:(r['weight'],r['recent'],r['balanced'],r['n']),reverse=True)
+    return {'prediction':pred,'confidence':round(conf,2),'agreement':round(agree,4),'strategies':preds,
+            'top':rows[:14],'memory':mem,'strategy_count':len(preds),'strategy_catalog':len(STRATEGY_NAMES),
+            'engine':'OMNI-MAX','regime':regime,'edge':round(edge,4)}
