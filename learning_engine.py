@@ -1418,3 +1418,229 @@ def ensemble_prediction(seq, perf=None, memory=None, board=None):
     rows.sort(key=lambda r:(r['weight'],r['n'],r['rate']),reverse=True)
     return {'prediction':pred,'confidence':round(conf,2),'agreement':round(agree,4),
             'strategies':preds,'top':rows[:12],'memory':mem,'strategy_count':len(preds)}
+
+# ========================= ULTRA-79 ONLINE ADAPTIVE LAYER =========================
+# Adds 12 meta-strategies and recent/balanced-performance weighting.
+# Important: confidence remains a calibrated signal-strength score, not a guarantee.
+_BASE67_NAMES = tuple(STRATEGY_NAMES)
+_base67_strategy_predictions = strategy_predictions
+
+
+def _u_majority(seq, fns, fallback=None):
+    vals=[]
+    for fn in fns:
+        try:
+            v=fn(seq)
+        except Exception:
+            v=None
+        if v in ('TÀI','XỈU'):
+            vals.append(v)
+    if fallback is None:
+        fallback=_markov_prediction(seq,2) if seq else 'TÀI'
+    return _majority(vals,fallback)
+
+
+def _u_run_transition(seq):
+    return _u_majority(seq,[
+        _run_hazard_prediction,_run_length_markov_prediction,
+        lambda s:_decayed_transition_prediction(s,2),_transition_drift_prediction,
+        _run_context_joint_prediction], _run_hazard_prediction(seq))
+
+
+def _u_motif_context(seq):
+    return _u_majority(seq,[
+        _motif_weighted_prediction,_motif_survival_prediction,
+        _suffix_prediction,_ctw_approx_prediction,_vom_context6_prediction],
+        _motif_weighted_prediction(seq))
+
+
+def _u_bayes_drift(seq):
+    return _u_majority(seq,[
+        _bayes_context_prediction,_hierarchical_bayes_prediction,
+        _sequential_change_prediction,_transition_drift_prediction,
+        _cross_horizon_bayes_prediction], _bayes_context_prediction(seq))
+
+
+def _u_entropy_regime(seq):
+    return _u_majority(seq,[
+        _entropy_gate_prediction,_context_entropy_prediction,
+        _regime_switch_prediction,_regime_posterior_prediction,
+        _changepoint_adaptive_prediction], _regime_switch_prediction(seq))
+
+
+def _u_multiscale_motif(seq):
+    return _u_majority(seq,[
+        _multiscale_transition_prediction,_multiresolution_edge_prediction,
+        _motif_weighted_prediction,_lag_ensemble_prediction,_spectral_lag_prediction],
+        _multiscale_transition_prediction(seq))
+
+
+def _u_knn_suffix(seq):
+    return _u_majority(seq,[
+        _analog_knn_prediction,_knn_recency_prediction,
+        _suffix_prediction,_horizon_consensus_prediction,_periodic_match_prediction],
+        _knn_recency_prediction(seq))
+
+
+def _u_ctw_run(seq):
+    return _u_majority(seq,[
+        _ctw_approx_prediction,_run_context_joint_prediction,
+        _bayes_run_mixture_prediction,_run_survival_prediction,_wilson_context_prediction],
+        _ctw_approx_prediction(seq))
+
+
+def _u_long_short(seq):
+    short=seq[-48:] if len(seq)>48 else seq
+    long=seq[-320:] if len(seq)>320 else seq
+    return _majority([
+        _decayed_transition_prediction(short,2),
+        _motif_weighted_prediction(short),
+        _long_memory_bayes_prediction(long),
+        _multiscale_transition_prediction(long),
+        _cross_horizon_bayes_prediction(seq),
+    ], _bayes_context_prediction(seq))
+
+
+def _u_changepoint_guard(seq):
+    return _u_majority(seq,[
+        _sequential_change_prediction,_changepoint_adaptive_prediction,
+        _transition_drift_prediction,_regime_switch_prediction,_robust_stack_prediction],
+        _sequential_change_prediction(seq))
+
+
+def _u_lag_run(seq):
+    return _u_majority(seq,[
+        _lag_ensemble_prediction,_spectral_lag_prediction,
+        _run_hazard_prediction,_run_profile_long_prediction,_run_matrix_prediction],
+        _lag_ensemble_prediction(seq))
+
+
+def _u_hierarchical_stack(seq):
+    return _u_majority(seq,[
+        _hierarchical_bayes_prediction,_dirichlet_vom_prediction,
+        _ctw_approx_prediction,_wilson_context_prediction,_robust_stack_prediction],
+        _hierarchical_bayes_prediction(seq))
+
+
+def _u_stable_ensemble(seq):
+    experts=[
+        _v56_stability_guard(seq),_u_bayes_drift(seq),_u_entropy_regime(seq),
+        _u_long_short(seq),_u_motif_context(seq),_u_run_transition(seq),
+        _u_hierarchical_stack(seq)
+    ]
+    return _majority(experts,_robust_stack_prediction(seq))
+
+
+_ULTRA12 = (
+    'RUN_TRANSITION_FUSION','MOTIF_CONTEXT_FUSION','BAYES_DRIFT_FUSION',
+    'ENTROPY_REGIME_FUSION','MULTISCALE_MOTIF_FUSION','KNN_SUFFIX_FUSION',
+    'CTW_RUN_FUSION','LONG_SHORT_CONSENSUS','CHANGEPOINT_GUARD_79',
+    'LAG_RUN_FUSION','HIERARCHICAL_STACK_79','STABLE_ENSEMBLE_79'
+)
+STRATEGY_NAMES = tuple(dict.fromkeys(_BASE67_NAMES + _ULTRA12))
+
+
+def strategy_predictions(seq, board=None):
+    seq=[x for x in seq if x in ('TÀI','XỈU')]
+    if not seq:
+        return {}
+    out=dict(_base67_strategy_predictions(seq,board))
+    out.update({
+        'RUN_TRANSITION_FUSION':_u_run_transition(seq),
+        'MOTIF_CONTEXT_FUSION':_u_motif_context(seq),
+        'BAYES_DRIFT_FUSION':_u_bayes_drift(seq),
+        'ENTROPY_REGIME_FUSION':_u_entropy_regime(seq),
+        'MULTISCALE_MOTIF_FUSION':_u_multiscale_motif(seq),
+        'KNN_SUFFIX_FUSION':_u_knn_suffix(seq),
+        'CTW_RUN_FUSION':_u_ctw_run(seq),
+        'LONG_SHORT_CONSENSUS':_u_long_short(seq),
+        'CHANGEPOINT_GUARD_79':_u_changepoint_guard(seq),
+        'LAG_RUN_FUSION':_u_lag_run(seq),
+        'HIERARCHICAL_STACK_79':_u_hierarchical_stack(seq),
+        'STABLE_ENSEMBLE_79':_u_stable_ensemble(seq),
+    })
+    raw=_majority(list(out.values()),_markov_prediction(seq,2))
+    return {name:out.get(name,raw) for name in STRATEGY_NAMES}
+
+
+def _adaptive_weight(st):
+    st=st or {}
+    n=max(0,int(st.get('n',0) or 0)); wins=max(0,min(int(st.get('wins',0) or 0),n))
+    rn=max(0,int(st.get('recent_n',0) or 0)); rw=max(0,min(int(st.get('recent_wins',0) or 0),rn))
+    tn=max(0,int(st.get('tai_n',0) or 0)); tw=max(0,min(int(st.get('tai_wins',0) or 0),tn))
+    xn=max(0,int(st.get('xiu_n',0) or 0)); xw=max(0,min(int(st.get('xiu_wins',0) or 0),xn))
+    global_rate=(wins+10.0)/(n+20.0)
+    recent_rate=(rw+5.0)/(rn+10.0) if rn else .5
+    if tn and xn:
+        tai_rate=(tw+4.0)/(tn+8.0); xiu_rate=(xw+4.0)/(xn+8.0)
+        balanced=(tai_rate+xiu_rate)/2.0
+    else:
+        balanced=global_rate
+    quality=.38*global_rate+.37*recent_rate+.25*balanced
+    maturity=min(1.0,n/120.0)
+    recent_maturity=min(1.0,rn/60.0)
+    evidence=.55*maturity+.45*recent_maturity
+    # Bad/unstable strategies are actually down-weighted; no early strategy can dominate.
+    weight=.52 + evidence*_clamp((quality-.43)*3.0, -.30, 1.18)
+    return _clamp(weight,.30,1.70), quality, balanced, recent_rate
+
+
+def _regime_name(seq):
+    if not seq:
+        return 'COLD'
+    run=_run_len(seq)
+    e=_entropy(seq[-24:]) if len(seq)>=4 else 1.0
+    if run>=5:
+        return 'LONG-RUN'
+    if e>=.96:
+        return 'NOISY'
+    if e<=.72:
+        return 'TREND'
+    if len(seq)>=12:
+        flips=sum(1 for i in range(max(1,len(seq)-12),len(seq)) if seq[i]!=seq[i-1])
+        if flips>=8:
+            return 'ALTERNATING'
+    return 'MIXED'
+
+
+def ensemble_prediction(seq, perf=None, memory=None, board=None):
+    perf=perf or {}
+    preds=strategy_predictions(seq,board)
+    if not preds:
+        return {'prediction':'TÀI','confidence':50.0,'agreement':0.5,'strategies':{},'top':[],
+                'strategy_count':len(STRATEGY_NAMES),'engine':'ULTRA-79'}
+    score={'TÀI':0.0,'XỈU':0.0}; rows=[]
+    for name,pred in preds.items():
+        st=perf.get(name) or {}
+        w,q,bacc,rr=_adaptive_weight(st)
+        score[pred]+=w
+        n=int(st.get('n',0) or 0); wins=int(st.get('wins',0) or 0)
+        rows.append({'name':name,'prediction':pred,'n':n,'wins':wins,
+                     'rate':round(q,4),'balanced':round(bacc,4),'recent':round(rr,4),'weight':round(w,4)})
+    mem=None
+    if memory:
+        support=int(memory.get('support',0) or 0); p=float(memory.get('p_tai',.5) or .5)
+        edge=abs(p-.5)*2
+        if support>=4 and edge>=.05:
+            mside='TÀI' if p>=.5 else 'XỈU'
+            mw=min(2.35,.30+math.log1p(support)*.27+edge*1.35)
+            score[mside]+=mw
+            mem={'prediction':mside,'weight':round(mw,3),'support':support,'p_tai':round(p,4),
+                 'pattern':memory.get('pattern'),'length':memory.get('length')}
+    total=score['TÀI']+score['XỈU']; pred='TÀI' if score['TÀI']>=score['XỈU'] else 'XỈU'
+    agree=score[pred]/total if total else .5
+    validated=[r for r in rows if r['n']>=24]
+    quality=sum(r['rate'] for r in validated)/len(validated) if validated else .5
+    edge=abs(score['TÀI']-score['XỈU'])/max(total,1e-9)
+    # Conservative calibration: many correlated strategies must not fake 90% confidence.
+    conf=50 + max(0,agree-.5)*28 + max(0,quality-.5)*14 + edge*4
+    if len(seq)<20: conf=min(conf,53.5)
+    elif len(seq)<50: conf=min(conf,58.5)
+    elif len(seq)<100: conf=min(conf,63.0)
+    if not validated: conf=min(conf,57.5)
+    if _regime_name(seq)=='NOISY': conf=min(conf,61.5)
+    conf=_clamp(conf,50.0,69.5)
+    rows.sort(key=lambda r:(r['weight'],r['recent'],r['balanced'],r['n']),reverse=True)
+    return {'prediction':pred,'confidence':round(conf,2),'agreement':round(agree,4),
+            'strategies':preds,'top':rows[:12],'memory':mem,'strategy_count':len(preds),
+            'engine':'ULTRA-79','regime':_regime_name(seq),'edge':round(edge,4)}
