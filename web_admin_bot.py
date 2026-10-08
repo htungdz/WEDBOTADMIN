@@ -1,14 +1,16 @@
-# DEVELOPER THANHTUNG VIP · 24/7 LEARNING BACKEND + ADMIN BOT
+# DEVELOPER THANHTUNG · 24/7 LEARNING BACKEND + ADMIN BOT
 # External HTML can be hosted anywhere. This process provides API/cache/learning.
 # Run: python web_admin_bot.py
 
 import os, re, json, time, math, html, asyncio, sqlite3, hashlib, threading
 from pathlib import Path
+from datetime import datetime, timezone, timedelta
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 import httpx
 from learning_engine import STRATEGY_NAMES, strategy_predictions, ensemble_prediction
+from secure_core import analyze_hash
 
 BASE_DIR = Path(__file__).resolve().parent
 PORT = int(os.getenv('PORT','8080'))
@@ -20,7 +22,7 @@ BOT_POLL_TIMEOUT = max(5,int(os.getenv('BOT_POLL_TIMEOUT','20')))
 MAX_BACKFILL_PER_BOARD=max(80,min(800,int(os.getenv('MAX_BACKFILL_PER_BOARD','320'))))
 
 DEFAULT_CONFIG = {
-    'brand':'DEVELOPER THANHTUNG VIP',
+    'brand':'DEVELOPER THANHTUNG',
     'sunwin_game_url':'https://web.sunwin.jetzt/?affId=Sunwin',
     'sunwin_current_api':'https://amongst-plots-called-dining.trycloudflare.com/api/tx',
     'sunwin_current_fallback':'https://kwinstore.com/sunwin/tx/9b7a587deb56a4caf8de8ffdb0c13e8d22e793ae598b66c7',
@@ -30,6 +32,20 @@ DEFAULT_CONFIG = {
 }
 
 LOCK=threading.RLock()
+ALLOWED_ORIGINS={x.strip().rstrip('/') for x in os.getenv('ALLOWED_ORIGINS','*').split(',') if x.strip()}
+RATE_LIMIT_PER_MIN=max(10,int(os.getenv('RATE_LIMIT_PER_MIN','90')))
+_RATE={}
+def _origin_ok(origin):
+    return '*' in ALLOWED_ORIGINS or (origin or '').rstrip('/') in ALLOWED_ORIGINS
+def _rate_ok(ip):
+    now=int(time.time()//60); key=(ip,now)
+    with LOCK:
+        n=_RATE.get(key,0)+1; _RATE[key]=n
+        if len(_RATE)>5000:
+            for k in list(_RATE):
+                if k[1] < now-2: _RATE.pop(k,None)
+    return n<=RATE_LIMIT_PER_MIN
+
 CONFIG={}
 CACHE={
     'sun_current':{'ok':False,'data':None,'ts':0,'error':'chưa tải'},
@@ -112,9 +128,147 @@ def ensure_db():
           details_json TEXT,
           updated_at REAL NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS devices(
+          device_id TEXT PRIMARY KEY,
+          app TEXT NOT NULL DEFAULT '',
+          ip TEXT NOT NULL DEFAULT '',
+          origin TEXT NOT NULL DEFAULT '',
+          user_agent TEXT NOT NULL DEFAULT '',
+          first_seen REAL NOT NULL,
+          last_seen REAL NOT NULL,
+          banned INTEGER NOT NULL DEFAULT 0,
+          banned_at REAL NOT NULL DEFAULT 0,
+          note TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_devices_last_seen ON devices(last_seen DESC);
+        CREATE INDEX IF NOT EXISTS idx_devices_ip ON devices(ip);
+
+        CREATE TABLE IF NOT EXISTS banned_ips(
+          ip TEXT PRIMARY KEY,
+          reason TEXT NOT NULL DEFAULT '',
+          created_at REAL NOT NULL
+        );
         """)
         con.commit()
 
+
+
+def _client_ip(handler):
+    # Railway/proxy normally supplies X-Forwarded-For.
+    xff=(handler.headers.get('X-Forwarded-For','') or '').split(',')[0].strip()
+    return xff or (handler.headers.get('X-Real-IP','') or '').strip() or str(handler.client_address[0])
+
+def _norm_device_id(v):
+    v=re.sub(r'[^a-zA-Z0-9_-]','',str(v or ''))[:96]
+    return v
+
+def _ip_banned(ip):
+    if not ip:return False
+    with db() as con:
+        return con.execute('SELECT 1 FROM banned_ips WHERE ip=?',(ip,)).fetchone() is not None
+
+def _device_banned(device_id):
+    device_id=_norm_device_id(device_id)
+    if not device_id:return False
+    with db() as con:
+        r=con.execute('SELECT banned FROM devices WHERE device_id=?',(device_id,)).fetchone()
+    return bool(r and int(r['banned'] or 0))
+
+def register_device(device_id, app, ip, origin, user_agent):
+    device_id=_norm_device_id(device_id)
+    if not device_id:
+        raise ValueError('device_id không hợp lệ')
+    app=re.sub(r'[^a-zA-Z0-9_.-]','',str(app or 'web'))[:40] or 'web'
+    now=time.time()
+    with db() as con:
+        old=con.execute('SELECT first_seen,banned,banned_at,note FROM devices WHERE device_id=?',(device_id,)).fetchone()
+        if old:
+            con.execute("""UPDATE devices SET app=?,ip=?,origin=?,user_agent=?,last_seen=?
+                           WHERE device_id=?""",
+                        (app,ip,str(origin or '')[:240],str(user_agent or '')[:500],now,device_id))
+        else:
+            con.execute("""INSERT INTO devices(device_id,app,ip,origin,user_agent,first_seen,last_seen,banned,banned_at,note)
+                           VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                        (device_id,app,ip,str(origin or '')[:240],str(user_agent or '')[:500],now,now,0,0,''))
+        con.commit()
+        r=con.execute('SELECT * FROM devices WHERE device_id=?',(device_id,)).fetchone()
+    return dict(r) if r else {}
+
+def device_access_status(device_id, ip):
+    ip_ban=_ip_banned(ip)
+    dev_ban=_device_banned(device_id)
+    return {
+        'ok': not (ip_ban or dev_ban),
+        'banned': bool(ip_ban or dev_ban),
+        'ip_banned': bool(ip_ban),
+        'device_banned': bool(dev_ban),
+        'ip': ip,
+        'device_id': _norm_device_id(device_id)
+    }
+
+def set_ip_ban(ip, banned=True, reason=''):
+    ip=str(ip or '').strip()
+    if not ip or len(ip)>80 or not re.fullmatch(r'[0-9a-fA-F:.]+',ip):
+        raise ValueError('IP không hợp lệ.')
+    with db() as con:
+        if banned:
+            con.execute("""INSERT INTO banned_ips(ip,reason,created_at) VALUES(?,?,?)
+                           ON CONFLICT(ip) DO UPDATE SET reason=excluded.reason,created_at=excluded.created_at""",
+                        (ip,str(reason or '')[:240],time.time()))
+        else:
+            con.execute('DELETE FROM banned_ips WHERE ip=?',(ip,))
+        con.commit()
+
+def set_device_ban(device_id, banned=True, note=''):
+    device_id=_norm_device_id(device_id)
+    if not device_id:
+        raise ValueError('Device ID không hợp lệ.')
+    with db() as con:
+        r=con.execute('SELECT 1 FROM devices WHERE device_id=?',(device_id,)).fetchone()
+        if not r:
+            raise ValueError('Không tìm thấy thiết bị.')
+        con.execute('UPDATE devices SET banned=?,banned_at=?,note=? WHERE device_id=?',
+                    (1 if banned else 0,time.time() if banned else 0,str(note or '')[:240],device_id))
+        con.commit()
+
+def devices_text(limit=30):
+    limit=max(1,min(60,int(limit or 30)))
+    with db() as con:
+        rows=con.execute("""SELECT device_id,app,ip,origin,first_seen,last_seen,banned,note
+                            FROM devices ORDER BY last_seen DESC LIMIT ?""",(limit,)).fetchall()
+        ip_bans={r['ip'] for r in con.execute('SELECT ip FROM banned_ips').fetchall()}
+    lines=['<b>📱 QUẢN LÝ THIẾT BỊ</b>','━━━━━━━━━━━━━━━━━━']
+    if not rows:
+        lines.append('Chưa có thiết bị truy cập.')
+    for i,r in enumerate(rows,1):
+        did=r['device_id']; ip=r['ip'] or '—'
+        ban=bool(r['banned']) or ip in ip_bans
+        last=_fmt_ts(r['last_seen'])
+        lines.append(
+            f'{i:02d}. {"🔴" if ban else "🟢"} <b>{html.escape(r["app"] or "web")}</b> · <code>{html.escape(did)}</code>\n'
+            f'    IP: <code>{html.escape(ip)}</code>\n'
+            f'    Cuối: {last}\n'
+            f'    <code>/banip {html.escape(ip)}</code> · <code>/bandevice {html.escape(did)}</code>'
+        )
+    return '\n'.join(lines)[:3900]
+
+def device_detail_text(device_id):
+    device_id=_norm_device_id(device_id)
+    with db() as con:
+        r=con.execute('SELECT * FROM devices WHERE device_id=?',(device_id,)).fetchone()
+        ipban=bool(r and con.execute('SELECT 1 FROM banned_ips WHERE ip=?',(r['ip'],)).fetchone())
+    if not r:return '❌ Không tìm thấy thiết bị.'
+    banned=bool(r['banned']) or ipban
+    return (f'<b>📱 THIẾT BỊ</b>\n━━━━━━━━━━━━━━━━━━\n'
+            f'ID: <code>{html.escape(r["device_id"])}</code>\n'
+            f'App: <b>{html.escape(r["app"] or "web")}</b>\n'
+            f'IP: <code>{html.escape(r["ip"] or "—")}</code>\n'
+            f'Trạng thái: <b>{"BANNED 🔴" if banned else "ACTIVE 🟢"}</b>\n'
+            f'Lần đầu: {_fmt_ts(r["first_seen"])}\n'
+            f'Lần cuối: {_fmt_ts(r["last_seen"])}\n'
+            f'Origin: <code>{html.escape((r["origin"] or "—")[:150])}</code>\n'
+            f'UA: <code>{html.escape((r["user_agent"] or "—")[:220])}</code>')
 
 def safe_url(v):
     v=(v or '').strip()
@@ -283,8 +437,7 @@ def load_history_context(con,board,limit=1400):
 
 
 def perf_map(con,board):
-    # All-time + recent + class-balanced stats. Recent window reacts to regime changes;
-    # class stats reduce one-sided strategies from dominating on imbalanced runs.
+    # All-time + class-balanced + 20/60/160 recent windows.
     rows=con.execute("""
         SELECT strategy,
                COUNT(*) n,
@@ -299,7 +452,7 @@ def perf_map(con,board):
         'n':int(r['n'] or 0),'wins':int(r['wins'] or 0),
         'tai_n':int(r['tai_n'] or 0),'tai_wins':int(r['tai_wins'] or 0),
         'xiu_n':int(r['xiu_n'] or 0),'xiu_wins':int(r['xiu_wins'] or 0),
-        'recent_n':0,'recent_wins':0,
+        'recent_n':0,'recent_wins':0,'recent20_n':0,'recent20_wins':0,'recent60_n':0,'recent60_wins':0,
     } for r in rows}
     recent=con.execute("""
       WITH ranked AS (
@@ -307,14 +460,20 @@ def perf_map(con,board):
                ROW_NUMBER() OVER(PARTITION BY strategy ORDER BY created_at DESC) AS rn
         FROM strategy_log WHERE board=?
       )
-      SELECT strategy,COUNT(*) recent_n,SUM(ok) recent_wins
+      SELECT strategy,
+             SUM(CASE WHEN rn<=20 THEN 1 ELSE 0 END) recent20_n,
+             SUM(CASE WHEN rn<=20 THEN ok ELSE 0 END) recent20_wins,
+             SUM(CASE WHEN rn<=60 THEN 1 ELSE 0 END) recent60_n,
+             SUM(CASE WHEN rn<=60 THEN ok ELSE 0 END) recent60_wins,
+             SUM(CASE WHEN rn<=160 THEN 1 ELSE 0 END) recent_n,
+             SUM(CASE WHEN rn<=160 THEN ok ELSE 0 END) recent_wins
       FROM ranked WHERE rn<=160 GROUP BY strategy
     """,(board,)).fetchall()
     for r in recent:
         st=out.setdefault(r['strategy'],{'n':0,'wins':0,'tai_n':0,'tai_wins':0,'xiu_n':0,'xiu_wins':0})
-        st['recent_n']=int(r['recent_n'] or 0);st['recent_wins']=int(r['recent_wins'] or 0)
+        for k in ('recent20_n','recent20_wins','recent60_n','recent60_wins','recent_n','recent_wins'):
+            st[k]=int(r[k] or 0)
     return out
-
 
 def memory_signal(con,board,seq):
     best=None
@@ -351,21 +510,30 @@ def create_current_prediction(con,board,seq,meta_history=None):
     if len(seq)<6: return None
     perf=perf_map(con,board);mem=memory_signal(con,board,seq)
     e=ensemble_prediction(seq,perf=perf,memory=mem,board=board,meta_history=meta_history)
-    d={'board':board,'prediction':e['prediction'],'confidence':e['confidence'],
-       'agreement':round(e['agreement']*100,1),'source_len':len(seq),
+    # FORCE-MAX: always produce TÀI or XỈU. Weak signal lowers confidence only.
+    recent=list(con.execute('SELECT ok FROM prediction_log WHERE board=? ORDER BY id DESC LIMIT 20',(board,)))
+    recent_n=len(recent); recent_wins=sum(int(r['ok'] or 0) for r in recent)
+    recent_rate=(recent_wins/recent_n) if recent_n else .5
+    agreement_pct=round(e['agreement']*100,1)
+    conf=float(e['confidence']); edge=float(e.get('edge',0) or 0); regime=e.get('regime','MIXED')
+    if recent_n>=8 and recent_rate < .50:
+        conf=max(50.0, conf - min(5.5,(.50-recent_rate)*18))
+    d={'board':board,'prediction':e['prediction'],'display':e['prediction'],
+       'action':'DỰ ĐOÁN','forced':True,'confidence':round(conf,2),'agreement':agreement_pct,'source_len':len(seq),
        'strategy_count':e.get('strategy_count',len(STRATEGY_NAMES)),'memory':e.get('memory'),
-       'engine':e.get('engine','OMNI-MAX'),'regime':e.get('regime','MIXED'),'edge':e.get('edge',0),
+       'engine':e.get('engine','OMNI-MAX SUPER FAMILY'),'regime':regime,'edge':edge,
+       'recent_model_rate':round(recent_rate*100,1),'recent_model_n':recent_n,
        'top':e.get('top',[])[:8],'updated_at':time.time()}
-    con.execute('''
+    sql="""
       INSERT INTO current_prediction(board,prediction,confidence,agreement,source_len,details_json,updated_at)
       VALUES(?,?,?,?,?,?,?)
       ON CONFLICT(board) DO UPDATE SET prediction=excluded.prediction,confidence=excluded.confidence,
         agreement=excluded.agreement,source_len=excluded.source_len,details_json=excluded.details_json,
         updated_at=excluded.updated_at
-    ''',(board,d['prediction'],d['confidence'],d['agreement'],len(seq),json.dumps(d,ensure_ascii=False,separators=(',',':')),d['updated_at']))
+    """
+    con.execute(sql,(board,d['prediction'],d['confidence'],d['agreement'],len(seq),json.dumps(d,ensure_ascii=False,separators=(',',':')),d['updated_at']))
     with LOCK: LATEST[board]=d
     return d
-
 
 def learn_rows(board,rows):
     if not rows: return 0
@@ -481,16 +649,70 @@ def prediction_payload(board):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version='ThanhtungLearning/4.0-OMNIMAX'
+    server_version='ThanhtungLearning/5.0-DEVICE'
     def log_message(self,fmt,*args): return
     def send_bytes(self,code,body,ctype='application/json; charset=utf-8'):
         self.send_response(code);self.send_header('Content-Type',ctype);self.send_header('Content-Length',str(len(body)))
-        self.send_header('Cache-Control','no-store, no-cache, must-revalidate');self.send_header('Access-Control-Allow-Origin','*')
-        self.send_header('Access-Control-Allow-Methods','GET, OPTIONS');self.send_header('Access-Control-Allow-Headers','Content-Type');self.end_headers();self.wfile.write(body)
+        self.send_header('Cache-Control','no-store, no-cache, must-revalidate')
+        origin=self.headers.get('Origin','')
+        allow='*' if '*' in ALLOWED_ORIGINS else (origin if _origin_ok(origin) else 'null')
+        self.send_header('Access-Control-Allow-Origin',allow)
+        self.send_header('Vary','Origin')
+        self.send_header('Access-Control-Allow-Methods','GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers','Content-Type, X-Device-ID')
+        self.end_headers();self.wfile.write(body)
     def do_OPTIONS(self): self.send_bytes(204,b'','text/plain')
+
+    def do_POST(self):
+        u=urlparse(self.path); path=u.path.rstrip('/') or '/'
+        origin=self.headers.get('Origin','')
+        if not _origin_ok(origin):
+            return self.send_bytes(403,json_bytes({'ok':False,'error':'origin blocked'}))
+        ip=_client_ip(self)
+        if not _rate_ok(ip):
+            return self.send_bytes(429,json_bytes({'ok':False,'error':'rate limited'}))
+
+        if path=='/api/device/register':
+            try:
+                ln=min(8192,max(0,int(self.headers.get('Content-Length','0') or 0)))
+                data=json.loads(self.rfile.read(ln).decode('utf-8') or '{}')
+                did=_norm_device_id(data.get('device_id'))
+                app=str(data.get('app') or 'web')[:40]
+                row=register_device(did,app,ip,origin,self.headers.get('User-Agent',''))
+                st=device_access_status(did,ip)
+                payload={'ok':st['ok'],**st,'app':row.get('app'),'first_seen':row.get('first_seen'),'last_seen':row.get('last_seen')}
+                return self.send_bytes(200 if st['ok'] else 403,json_bytes(payload))
+            except ValueError as e:
+                return self.send_bytes(400,json_bytes({'ok':False,'error':str(e)}))
+            except Exception:
+                return self.send_bytes(500,json_bytes({'ok':False,'error':'device register failed'}))
+
+        device_id=_norm_device_id(self.headers.get('X-Device-ID',''))
+        st=device_access_status(device_id,ip)
+        if st['banned']:
+            return self.send_bytes(403,json_bytes({'ok':False,'banned':True,'error':'Thiết bị hoặc IP đã bị khóa'}))
+
+        if path=='/api/hash/analyze':
+            try:
+                ln=min(4096,max(0,int(self.headers.get('Content-Length','0') or 0)))
+                data=json.loads(self.rfile.read(ln).decode('utf-8') or '{}')
+                result=analyze_hash(str(data.get('hash') or ''))
+                return self.send_bytes(200,json_bytes(result))
+            except ValueError as e:
+                return self.send_bytes(400,json_bytes({'ok':False,'error':str(e)}))
+            except Exception:
+                return self.send_bytes(500,json_bytes({'ok':False,'error':'analysis failed'}))
+        return self.send_bytes(404,json_bytes({'ok':False,'error':'not found'}))
+
     def do_GET(self):
         u=urlparse(self.path);path=u.path.rstrip('/') or '/';qs=parse_qs(u.query)
-        if path=='/':return self.send_bytes(200,json_bytes({'ok':True,'service':'DEVELOPER THANHTUNG VIP BACKEND','mode':'24/7 learner','engine':f'OMNI-MAX · {len(STRATEGY_NAMES)} strategy catalog + pattern memory 2-12','web':'host index externally'}))
+        if path.startswith('/api/') or path=='/config':
+            ip=_client_ip(self)
+            device_id=_norm_device_id(self.headers.get('X-Device-ID',''))
+            st=device_access_status(device_id,ip)
+            if st['banned']:
+                return self.send_bytes(403,json_bytes({'ok':False,'banned':True,'error':'Thiết bị hoặc IP đã bị khóa'}))
+        if path=='/':return self.send_bytes(200,json_bytes({'ok':True,'service':'DEVELOPER THANHTUNG BACKEND','mode':'24/7 learner','engine':f'OMNI-MAX SUPER FAMILY · {len(STRATEGY_NAMES)} strategy catalog + pattern memory 2-12','web':'host index externally'}))
         if path=='/config':return self.send_bytes(200,json_bytes({'ok':True,**public_config()}))
         if path=='/api/sun/current':
             c=cache_public('sun_current');return self.send_bytes(200 if c.get('ok') else 503,json_bytes(c))
@@ -564,14 +786,15 @@ def admin_keyboard():
     return {'inline_keyboard':[
         [{'text':'📊 HỌC CẦU','callback_data':'adm:stats'},{'text':'🏆 TOP THUẬT TOÁN','callback_data':'adm:algo'}],
         [{'text':'🎮 BÀN ĐÃ HỌC','callback_data':'adm:boards'},{'text':'📡 API STATUS','callback_data':'adm:api'}],
-        [{'text':'🔗 LINK / API','callback_data':'adm:links'}]
+        [{'text':'📄 TXT SUNWIN','callback_data':'adm:exportsun'},{'text':'📄 TXT BCR','callback_data':'adm:exportbcr'}],
+        [{'text':'📱 THIẾT BỊ','callback_data':'adm:devices'},{'text':'🔗 LINK / API','callback_data':'adm:links'}]
     ]}
 
 
 def admin_home():
     s=summary_payload();rate='—' if s['win_rate'] is None else f"{s['win_rate']}%"
-    return (f'<b>⚙️ DEVELOPER THANHTUNG VIP · ADMIN</b>\n━━━━━━━━━━━━━━━━━━\n'
-            f'🧠 Engine: <b>OMNI-MAX · {len(STRATEGY_NAMES)} strategy catalog</b>\n📚 Phiên đã học: <b>{s["rounds"]}</b>\n'
+    return (f'<b>⚙️ DEVELOPER THANHTUNG · ADMIN</b>\n━━━━━━━━━━━━━━━━━━\n'
+            f'🧠 Engine: <b>OMNI-MAX SUPER FAMILY · {len(STRATEGY_NAMES)} strategy catalog</b>\n📚 Phiên đã học: <b>{s["rounds"]}</b>\n'
             f'〽️ Cầu/mẫu đã học: <b>{s["patterns"]}</b> · chín {s["mature_patterns"]}\n'
             f'🎯 Backtest causal: <b>{s["settled_predictions"]}</b> · {rate}\n🎮 Bàn: <b>{s["boards"]}</b>\n\n'
             'Backend học 24/7 kể cả khi không ai mở web.')
@@ -625,6 +848,130 @@ def links_text():
             f'<b>BCR API</b>\n<code>{html.escape(cfg["bcr_api"])}</code>\n\n<code>/setsunlink URL</code>\n<code>/setsunapi URL</code>\n<code>/setsunhistory URL</code>\n<code>/setbcrapi URL</code>')
 
 
+
+def _fmt_ts(ts):
+    try:
+        dt=datetime.fromtimestamp(float(ts), timezone.utc).astimezone(timezone(timedelta(hours=7)))
+        return dt.strftime('%d-%m-%Y %H:%M:%S')
+    except Exception:
+        return '—'
+
+
+def _display_side(board, side):
+    if str(board).startswith('baccarat:'):
+        if side=='TÀI': return 'BANKER'
+        if side=='XỈU': return 'PLAYER'
+    return str(side or '—')
+
+
+def build_prediction_export(kind='sunwin'):
+    if kind=='sunwin':
+        where="p.board='sunwin:hu'"; title='SUNWIN'; fname='du_doan_sunwin.txt'
+    elif kind=='bcr':
+        where="p.board LIKE 'baccarat:%'"; title='BACCARAT'; fname='du_doan_baccarat.txt'
+    else:
+        where='1=1'; title='SUNWIN + BACCARAT'; fname='du_doan_full.txt'
+
+    sql=("SELECT p.board,p.external_key,p.prediction,p.actual,p.ok,p.created_at,"
+         "r.meta_json,r.seen_at "
+         "FROM prediction_log p "
+         "LEFT JOIN rounds r ON r.board=p.board AND r.external_key=p.external_key "
+         f"WHERE {where} AND p.actual IS NOT NULL "
+         "ORDER BY p.board,p.created_at,p.external_key")
+
+    with db() as con:
+        rows=con.execute(sql).fetchall()
+
+    total=len(rows)
+    wins=sum(int(r['ok'] or 0) for r in rows)
+    losses=total-wins
+    vn_tz=timezone(timedelta(hours=7))
+
+    def fmt_time(ts):
+        try:
+            ts=float(ts or 0)
+            if ts <= 0: return '—'
+            return datetime.fromtimestamp(ts,vn_tz).strftime('%H:%M:%S · %d/%m/%Y')
+        except Exception:
+            return '—'
+
+    lines=[
+        'DEVELOPER THANHTUNG',
+        f'LỊCH SỬ ĐÚNG / SAI · {title}',
+        '='*54,
+        f'Tổng: {total} · Đúng: {wins} · Sai: {losses}',
+        '='*54,
+        ''
+    ]
+
+    last_board=None
+    board_total=0
+    board_win=0
+
+    for r in rows:
+        board=r['board']
+        if board != last_board:
+            if last_board is not None:
+                lines += [f'Tổng bàn: {board_win}/{board_total} ĐÚNG · {board_total-board_win} SAI', '']
+            last_board=board
+            board_total=0
+            board_win=0
+            label=board.replace('baccarat:','BACCARAT · ').replace('sunwin:hu','SUNWIN')
+            lines += [f'### {label}', '-'*54]
+
+        board_total += 1
+        ok=bool(int(r['ok'] or 0))
+        board_win += int(ok)
+        pred=_display_side(board,r['prediction'])
+        actual=_display_side(board,r['actual'])
+        result='ĐÚNG ✅' if ok else 'SAI ❌'
+        tm=fmt_time(r['seen_at'] or r['created_at'])
+
+        meta={}
+        try:
+            meta=json.loads(r['meta_json'] or '{}')
+        except Exception:
+            meta={}
+
+        lines += [
+            f'#{r["external_key"]}',
+            f'Thời gian: {tm}',
+            f'{pred} → {actual} · {result}',
+        ]
+
+        if board=='sunwin:hu':
+            dice=meta.get('dice') or []
+            total_score=meta.get('total')
+            if isinstance(dice,list) and len(dice)==3:
+                lines.append(f'Xúc xắc: {dice[0]}-{dice[1]}-{dice[2]}')
+            else:
+                lines.append('Xúc xắc: —')
+            lines.append(f'Tổng: {total_score if total_score is not None else "—"}')
+
+        lines.append('')
+
+    if last_board is not None:
+        lines += [f'Tổng bàn: {board_win}/{board_total} ĐÚNG · {board_total-board_win} SAI', '']
+
+    if not rows:
+        lines += ['Chưa có phiên nào đã chốt kết quả.']
+
+    return fname, ('\n'.join(lines)).encode('utf-8')
+
+
+async def send_txt_document(client,chat_id,kind):
+    fname,data=await asyncio.to_thread(build_prediction_export,kind)
+    files={'document':(fname,data,'text/plain; charset=utf-8')}
+    label='SUNWIN' if kind=='sunwin' else 'BACCARAT' if kind=='bcr' else 'ALL'
+    form={'chat_id':str(chat_id),'caption':f'📄 FULL LOG {label} · {len(data):,} bytes'}
+    r=await client.post(f'https://api.telegram.org/bot{WEB_BOT_TOKEN}/sendDocument',data=form,files=files,timeout=30)
+    try:j=r.json()
+    except Exception:j={}
+    if not j.get('ok'):
+        raise RuntimeError(j.get('description') or f'Telegram HTTP {r.status_code}')
+    return j.get('result')
+
+
 async def send_admin(client,chat_id,text,keyboard=True):
     p={'chat_id':chat_id,'text':text,'parse_mode':'HTML','disable_web_page_preview':True}
     if keyboard:p['reply_markup']=admin_keyboard()
@@ -645,6 +992,34 @@ async def handle_admin_message(client,m):
         elif cmd=='/boards':out=boards_text()
         elif cmd in ('/topalgo','/algo'):out=algo_text()
         elif cmd=='/links':out=links_text()
+        elif cmd in ('/devices','/deviceall'):
+            lim=int(arg) if arg.isdigit() else 30
+            out=devices_text(lim)
+        elif cmd=='/device':
+            if not arg:raise ValueError('Dùng: /device DEVICE_ID')
+            out=device_detail_text(arg)
+        elif cmd=='/banip':
+            if not arg:raise ValueError('Dùng: /banip IP [lý do]')
+            aa=arg.split(maxsplit=1);set_ip_ban(aa[0],True,aa[1] if len(aa)>1 else 'admin')
+            out=f'⛔ Đã ban IP <code>{html.escape(aa[0])}</code>'
+        elif cmd=='/unbanip':
+            if not arg:raise ValueError('Dùng: /unbanip IP')
+            ip0=arg.split()[0];set_ip_ban(ip0,False)
+            out=f'✅ Đã mở ban IP <code>{html.escape(ip0)}</code>'
+        elif cmd=='/bandevice':
+            if not arg:raise ValueError('Dùng: /bandevice DEVICE_ID')
+            did=arg.split()[0];set_device_ban(did,True,'admin')
+            out=f'⛔ Đã ban thiết bị <code>{html.escape(did)}</code>'
+        elif cmd=='/unbandevice':
+            if not arg:raise ValueError('Dùng: /unbandevice DEVICE_ID')
+            did=arg.split()[0];set_device_ban(did,False,'')
+            out=f'✅ Đã mở ban thiết bị <code>{html.escape(did)}</code>'
+        elif cmd in ('/exportsun','/txtsun'):
+            await send_txt_document(client,chat_id,'sunwin');return
+        elif cmd in ('/exportbcr','/txtbcr'):
+            await send_txt_document(client,chat_id,'bcr');return
+        elif cmd in ('/exportall','/txtall'):
+            await send_txt_document(client,chat_id,'all');return
         elif cmd=='/resetlinks':
             with LOCK:CONFIG.clear();CONFIG.update(DEFAULT_CONFIG)
             save_config();out='✅ Đã khôi phục link/API mặc định.'
@@ -664,7 +1039,16 @@ async def handle_callback(client,q):
     uid=(q.get('from') or {}).get('id');msg=q.get('message') or {};chat_id=(msg.get('chat') or {}).get('id')
     await tg(client,'answerCallbackQuery',{'callback_query_id':q.get('id')})
     if uid not in ADMIN_IDS or not chat_id:return
-    data=q.get('data') or '';out={'adm:stats':stats_text,'adm:algo':algo_text,'adm:boards':boards_text,'adm:api':api_status_text,'adm:links':links_text}.get(data,admin_home)()
+    data=q.get('data') or ''
+    if data=='adm:exportsun':
+        try: await send_txt_document(client,chat_id,'sunwin')
+        except Exception as e: await send_admin(client,chat_id,'❌ '+html.escape(str(e)),True)
+        return
+    if data=='adm:exportbcr':
+        try: await send_txt_document(client,chat_id,'bcr')
+        except Exception as e: await send_admin(client,chat_id,'❌ '+html.escape(str(e)),True)
+        return
+    out={'adm:stats':stats_text,'adm:algo':algo_text,'adm:boards':boards_text,'adm:api':api_status_text,'adm:devices':devices_text,'adm:links':links_text}.get(data,admin_home)()
     await send_admin(client,chat_id,out,True)
 
 
@@ -673,11 +1057,15 @@ async def bot_loop():
         print('ℹ️ WEB_BOT_TOKEN chưa có: learner/API vẫn chạy, bot quản trị tắt.')
         while True:await asyncio.sleep(3600)
     async with httpx.AsyncClient(limits=httpx.Limits(max_connections=30,max_keepalive_connections=20)) as client:
-        await tg(client,'deleteWebhook',{'drop_pending_updates':False});await tg(client,'setMyName',{'name':'DEVELOPER THANHTUNG VIP ADMIN'})
+        await tg(client,'deleteWebhook',{'drop_pending_updates':False});await tg(client,'setMyName',{'name':'DEVELOPER THANHTUNG ADMIN'})
         await tg(client,'setMyCommands',{'commands':[
             {'command':'start','description':'Mở bảng quản trị'},{'command':'stats','description':'Thống kê học cầu 24/7'},
             {'command':'boards','description':'Phiên/cầu đã học từng bàn'},{'command':'topalgo','description':'Top thuật toán đã kiểm tra'},
             {'command':'status','description':'Trạng thái API'},{'command':'links','description':'Xem link/API'},
+            {'command':'devices','description':'Danh sách thiết bị/IP'},{'command':'device','description':'Chi tiết một thiết bị'},
+            {'command':'banip','description':'Ban IP'},{'command':'unbanip','description':'Mở ban IP'},
+            {'command':'bandevice','description':'Ban Device ID'},{'command':'unbandevice','description':'Mở ban Device ID'},
+            {'command':'exportsun','description':'Xuất TXT full dự đoán SUNWIN'},{'command':'exportbcr','description':'Xuất TXT full dự đoán Baccarat'},
             {'command':'setsunlink','description':'Đổi link game SUNWIN'},{'command':'setsunapi','description':'Đổi API current SUNWIN'},
             {'command':'setsunhistory','description':'Đổi API history SUNWIN'},{'command':'setsunfallback','description':'Đổi API fallback SUNWIN'},{'command':'setbcrapi','description':'Đổi API Baccarat'}]})
         offset=0
