@@ -39,7 +39,7 @@ CACHE={
     'bcr':{'ok':False,'data':None,'ts':0,'error':'chưa tải'},
 }
 LATEST={}
-LEARN_STATUS={'started':time.time(),'last_cycle':0,'last_error':'','new_rounds':0,'cycles':0}
+LEARN_STATUS={'started':time.time(),'last_cycle':0,'last_error':'','new_rounds':0,'last_new_round_at':0,'cycles':0}
 
 
 def db():
@@ -535,6 +535,7 @@ def learn_payloads(sun_history=None,sun_current=None,bcr_payload=None):
             for board,rows in normalize_bcr(bcr_payload).items(): total+=learn_rows(board,rows)
         with LOCK:
             LEARN_STATUS['last_cycle']=time.time();LEARN_STATUS['new_rounds']+=total;LEARN_STATUS['cycles']+=1;LEARN_STATUS['last_error']=''
+            if total>0: LEARN_STATUS['last_new_round_at']=time.time()
     except Exception as e:
         with LOCK: LEARN_STATUS['last_cycle']=time.time();LEARN_STATUS['last_error']=str(e)[:240]
     return total
@@ -710,11 +711,12 @@ def _txt_dice(meta):
     return parts if len(parts) == 3 else None
 
 
-def export_history_txt(kind='all', limit=None):
-    """Export only settled main predictions, not synthetic/unsettled rounds.
+def export_history_txt(kind='all', limit=None, include_unpredicted=False):
+    """Export settled predictions, or (opt-in) all observed game results.
 
-    Time columns are timestamps from backend ingestion/prediction logs,
-    NOT source game timestamps unless a future normalizer captures them.
+    Historical rounds without a prediction remain explicitly *unpredicted*;
+    they are never counted as correct/incorrect. No retrospective predictions
+    are invented to fill a reset/replaced SQLite database.
     """
     if kind not in ('sun', 'bcr', 'all'):
         raise ValueError('Loại lịch sử không hợp lệ')
@@ -722,102 +724,94 @@ def export_history_txt(kind='all', limit=None):
         limit = int(limit)
         if not 1 <= limit <= 100000:
             raise ValueError('Số phiên phải từ 1 đến 100000')
-
-    where = []
-    params = []
-    if kind == 'sun':
-        where.append("p.board LIKE 'sunwin:%'")
-    elif kind == 'bcr':
-        where.append("p.board LIKE 'baccarat:%'")
-    where.append("p.actual IN ('TÀI', 'XỈU')")
-    clause = ' AND '.join(where)
-
-    # Newest N records if limited; sort chronologically before formatting.
-    sql = f"""SELECT p.board,p.external_key,p.prediction,p.actual,p.ok,p.created_at,
-                     r.meta_json,r.seen_at
-              FROM prediction_log p
-              LEFT JOIN rounds r ON r.board=p.board AND r.external_key=p.external_key
-              WHERE {clause}
-              ORDER BY p.created_at DESC,p.board DESC,p.external_key DESC"""
+    board_filter = "r.board LIKE 'sunwin:%'" if kind == 'sun' else (
+        "r.board LIKE 'baccarat:%'" if kind == 'bcr' else '1=1')
+    params=[]
+    # Mode original: only confirmed predictions; opt-in mode: every recorded
+    # settled result with NULL prediction if none was made/logged.
+    if include_unpredicted:
+        sql=f"""SELECT r.board,r.external_key,p.prediction,r.result AS actual,
+                       p.ok,COALESCE(p.created_at,r.seen_at) AS created_at,
+                       r.meta_json,r.seen_at
+                FROM rounds r LEFT JOIN prediction_log p
+                ON p.board=r.board AND p.external_key=r.external_key
+                WHERE {board_filter} AND r.result IN ('TÀI','XỈU')
+                ORDER BY r.id DESC"""
+    else:
+        pred_filter = "p.board LIKE 'sunwin:%'" if kind=='sun' else (
+            "p.board LIKE 'baccarat:%'" if kind=='bcr' else '1=1')
+        sql=f"""SELECT p.board,p.external_key,p.prediction,p.actual,p.ok,
+                       p.created_at,r.meta_json,r.seen_at
+                FROM prediction_log p LEFT JOIN rounds r
+                ON r.board=p.board AND r.external_key=p.external_key
+                WHERE {pred_filter} AND p.actual IN ('TÀI','XỈU')
+                ORDER BY p.created_at DESC,p.board DESC,p.external_key DESC"""
     if limit is not None:
-        sql += ' LIMIT ?'
-        params.append(limit)
+        sql+=' LIMIT ?';params.append(limit)
     with db() as con:
-        entries = [dict(r) for r in con.execute(sql, params).fetchall()]
+        entries=[dict(x) for x in con.execute(sql,params)]
+        seen_total=con.execute('SELECT COUNT(*) FROM rounds WHERE '+board_filter.replace('r.board','board'),()).fetchone()[0]
     entries.reverse()
-
-    title = {'sun':'SUNWIN', 'bcr':'BACCARAT', 'all':'SUNWIN + BACCARAT'}[kind]
-    stamp = _txt_time(time.time())
-    wins = sum(1 for r in entries if int(r['ok'] or 0) == 1)
-    lines = [
+    title={'sun':'SUNWIN','bcr':'BACCARAT','all':'SUNWIN + BACCARAT'}[kind]
+    wins=sum(x['prediction'] is not None and x['prediction']==x['actual'] for x in entries)
+    evaluated=sum(x['prediction'] is not None for x in entries)
+    missing=len(entries)-evaluated
+    lines=[
         'DEVELOPER THANHTUNG · LỊCH SỬ DỰ ĐOÁN',
         '='*44,
         f'Loại: {title}',
-        f'Xuất lúc: {stamp} (UTC+7)',
-        f'Số phiên có dự đoán đã chốt: {len(entries)}',
-        f'ĐÚNG: {wins} | SAI: {len(entries)-wins}',
-        'Thời gian dưới đây là giờ backend ghi nhận,',
-        'có thể khác giờ thực của phiên khi API không cung cấp timestamp.',
-        'Chỉ xuất dự đoán đã có kết quả, không tự tạo dữ liệu.',
-        '='*44,
-        '',
+        f'Xuất lúc: {_txt_time(time.time())} (UTC+7)',
+        f'Chế độ: {"TẤT CẢ KẾT QUẢ ĐÃ LƯU" if include_unpredicted else "CHỈ PHIÊN CÓ DỰ ĐOÁN"}',
+        f'Tổng phiên đã lưu trong SQLite ({title}): {seen_total}',
+        f'Số phiên trong TXT: {len(entries)}',
+        f'Có dự đoán: {evaluated} | Chưa dự đoán: {missing}',
+        f'ĐÚNG: {wins} | SAI: {evaluated-wins}',
+        'Phiên chưa dự đoán KHÔNG tính ĐÚNG/SAI.',
+        'Thời gian là giờ backend ghi nhận, có thể khác giờ gốc.',
+        'Lịch sử cũ mất khi đổi/xóa SQLite không thể tự khôi phục.',
+        '='*44,'',
     ]
     if not entries:
-        lines.extend(['Chưa có phiên dự đoán được chốt trong database.',
-                      'Kiểm tra API và bảng thống kê học nền trên bot admin.'])
-    last_board = None
+        lines.extend(['Chưa có dữ liệu phù hợp trong database.',
+                      'Dùng /dbstatus để kiểm tra API, SQLite và phiên cuối.'])
+    last_board=None
     for r in entries:
-        board = r['board']
-        if board != last_board:
-            if board.startswith('baccarat:'):
-                lines.extend(['', f'BACCARAT · BÀN {board.split(":",1)[1]}', '-'*34])
-            else:
-                lines.extend(['', 'SUNWIN · TÀI/XỈU', '-'*34])
-            last_board = board
-
+        board=r['board']
+        if board!=last_board:
+            lines.extend(['',f'BACCARAT · BÀN {board.split(":",1)[1]}' if board.startswith('baccarat:') else 'SUNWIN · TÀI/XỈU','-'*34]);last_board=board
         try:
-            meta = json.loads(r['meta_json'] or '{}')
-            if not isinstance(meta, dict): meta = {}
-        except (json.JSONDecodeError, TypeError):
-            meta = {}
-        identifier = meta.get('sid') if board.startswith('sunwin:') else None
+            meta=json.loads(r['meta_json'] or '{}')
+            if not isinstance(meta,dict):meta={}
+        except (json.JSONDecodeError,TypeError):meta={}
+        identifier=meta.get('sid') if board.startswith('sunwin:') else None
         if not identifier:
             if board.startswith('baccarat:'):
-                shoe = meta.get('shoe') or '—'
-                pos = meta.get('pos') or '—'
-                identifier = f'{shoe} / ván {pos}'
-            else:
-                identifier = r['external_key']
-        predicted = _txt_side(board, r['prediction'])
-        actual = _txt_side(board, r['actual'])
-        correct = int(r['ok'] or 0) == 1
-        event_time = r['seen_at'] if r['seen_at'] is not None else r['created_at']
+                identifier=f'{meta.get("shoe") or "—"} / ván {meta.get("pos") or "—"}'
+            else:identifier=r['external_key']
         lines.append(f'#{identifier}')
-        lines.append(f'Thời gian ghi nhận: {_txt_time(event_time)}')
-        lines.append(f'{predicted} → {actual} · {"ĐÚNG ✅" if correct else "SAI ❌"}')
+        lines.append(f'Thời gian ghi nhận: {_txt_time(r["seen_at"] if r["seen_at"] is not None else r["created_at"])}')
+        if r['prediction'] is None:
+            lines.append(f'CHƯA DỰ ĐOÁN → {_txt_side(board,r["actual"])} · CHỈ GHI KẾT QUẢ')
+        else:
+            correct=(r['prediction']==r['actual'])
+            lines.append(f'{_txt_side(board,r["prediction"])} → {_txt_side(board,r["actual"])} · {"ĐÚNG ✅" if correct else "SAI ❌"}')
         if board.startswith('sunwin:'):
-            dice = _txt_dice(meta)
-            if dice:
-                lines.append('Xúc xắc: ' + '-'.join(map(str,dice)))
-            else:
-                lines.append('Xúc xắc: — (API không cung cấp)')
-            total = meta.get('total')
+            dice=_txt_dice(meta)
+            lines.append('Xúc xắc: '+'-'.join(map(str,dice)) if dice else 'Xúc xắc: — (API không cung cấp)')
+            total=meta.get('total')
             try:
-                total = int(total) if total is not None else sum(dice) if dice else None
-                if total is not None and not 3 <= total <= 18: total = None
-            except (TypeError, ValueError):
-                total = None
+                total=int(total) if total is not None else sum(dice) if dice else None
+                if total is not None and not 3<=total<=18:total=None
+            except (TypeError,ValueError):total=None
             lines.append(f'Tổng: {total if total is not None else "—"}')
         lines.append('')
-
-    filename = f'thanhtung_{kind}_lich_su_{datetime.now(EXPORT_TIMEZONE):%Y%m%d_%H%M%S}.txt'
-    # UTF-8 BOM: Vietnamese displays correctly on common phone text viewers.
-    data = ('\n'.join(lines).rstrip()+'\n').encode('utf-8-sig')
-    return filename, data, len(entries)
+    suffix='_tat_ca_ket_qua' if include_unpredicted else ''
+    filename=f'thanhtung_{kind}_lich_su{suffix}_{datetime.now(EXPORT_TIMEZONE):%Y%m%d_%H%M%S}.txt'
+    return filename,('\n'.join(lines).rstrip()+'\n').encode('utf-8-sig'),len(entries)
 
 
-async def send_txt_document(client, chat_id, kind, limit=None):
-    filename, data, count = await asyncio.to_thread(export_history_txt, kind, limit)
+async def send_txt_document(client, chat_id, kind, limit=None, include_unpredicted=False):
+    filename, data, count = await asyncio.to_thread(export_history_txt, kind, limit, include_unpredicted)
     if not WEB_BOT_TOKEN:
         raise RuntimeError('WEB_BOT_TOKEN chưa cấu hình')
     # Multipart upload is required by Telegram sendDocument; the existing
@@ -825,7 +819,7 @@ async def send_txt_document(client, chat_id, kind, limit=None):
     resp = await client.post(
         f'https://api.telegram.org/bot{WEB_BOT_TOKEN}/sendDocument',
         data={'chat_id':str(chat_id),
-              'caption': f'📄 {kind.upper()} · {count} phiên đã chốt · DEVELOPER THANHTUNG'},
+              'caption': f'📄 {kind.upper()} · {count} {"kết quả đã lưu" if include_unpredicted else "phiên có dự đoán"} · DEVELOPER THANHTUNG'},
         files={'document':(filename, io.BytesIO(data), 'text/plain; charset=utf-8')},
         timeout=httpx.Timeout(45.0, connect=8.0),
     )
@@ -878,6 +872,43 @@ def api_status_text():
         v=c[k];age=int(time.time()-v.get('ts',0)) if v.get('ts') else -1
         return f'{"🟢" if v.get("ok") else "🔴"} {label} · {age}s' + (f'\n└ {html.escape(str(v.get("error")))}' if not v.get('ok') and v.get('error') else '')
     return '<b>📡 API STATUS</b>\n'+one('sun_current','SUN CURRENT')+'\n'+one('sun_history','SUN HISTORY')+'\n'+one('bcr','BCR')
+
+
+def db_status_text():
+    """Admin-only diagnostic for stale API / fresh database / missing predictions."""
+    with db() as con:
+        allr=con.execute("SELECT COUNT(*) n FROM rounds WHERE board LIKE 'sunwin:%'").fetchone()['n']
+        allp=con.execute("SELECT COUNT(*) n FROM prediction_log WHERE board LIKE 'sunwin:%'").fetchone()['n']
+        last=con.execute("SELECT external_key,seen_at FROM rounds WHERE board LIKE 'sunwin:%' ORDER BY id DESC LIMIT 1").fetchone()
+        lastpred=con.execute("SELECT external_key,created_at FROM prediction_log WHERE board LIKE 'sunwin:%' ORDER BY created_at DESC, rowid DESC LIMIT 1").fetchone()
+    with LOCK:
+        caches={k:dict(v) for k,v in CACHE.items()}
+        learn=dict(LEARN_STATUS)
+    def api_round(kind):
+        x=caches.get(kind,{})
+        if not x.get('ok'):
+            return 'LỖI: '+str(x.get('error') or 'không nhận được API')[:90]
+        try:
+            found=normalize_sun(x.get('data')) if kind=='sun_history' else normalize_sun_current(x.get('data'))
+            if not found: return 'Không đọc được ID/kết quả phiên từ API'
+            return '#'+str(found[-1]['key'])
+        except Exception as e:
+            return 'Lỗi parse: '+str(e)[:80]
+    new_ts=learn.get('last_new_round_at') or 0
+    age='—' if not new_ts else str(int((time.time()-new_ts)//60))+' phút trước'
+    return ('<b>🧰 KIỂM TRA LỊCH SỬ / SQLITE</b>\n━━━━━━━━━━━━━━━━━━\n'
+            +f'📁 DB_PATH: <code>{html.escape(DB_PATH)}</code>\n'
+            +f'📚 SUNWIN đã lưu: <b>{allr}</b> kết quả\n'
+            +f'🎯 SUNWIN có dự đoán: <b>{allp}</b>\n'
+            +f'📍 Phiên SQLite mới nhất: <b>{html.escape(str(last["external_key"])) if last else "—"}</b>\n'
+            +f'🧠 Phiên có dự đoán mới nhất: <b>{html.escape(str(lastpred["external_key"])) if lastpred else "—"}</b>\n'
+            +f'🛰 SUN CURRENT: <b>{html.escape(api_round("sun_current"))}</b>\n'
+            +f'🛰 SUN HISTORY: <b>{html.escape(api_round("sun_history"))}</b>\n'
+            +f'⏱ Lần ghi phiên mới: {age}\n'
+            +f'⚠️ Lỗi học gần nhất: {html.escape(learn.get("last_error") or "Không")}\n\n'
+            +'<i>API trả phiên cũ: cần sửa API. SQLite ít phiên: kiểm tra Volume/DB_PATH. '
+            +'Chỉ có 72 dự đoán: backfill lúc khởi tạo từng có giới hạn 72; '
+            +'dùng /exportsunall để xuất cả phiên không được dự đoán.</i>')
 
 
 def stats_text():
@@ -940,11 +971,14 @@ async def handle_admin_message(client,m):
         elif cmd=='/boards':out=boards_text()
         elif cmd in ('/topalgo','/algo'):out=algo_text()
         elif cmd=='/links':out=links_text()
-        elif cmd in ('/exportsun','/txtsun','/exportbcr','/txtbcr','/exportall','/txtall'):
-            kind = 'sun' if cmd in ('/exportsun','/txtsun') else 'bcr' if cmd in ('/exportbcr','/txtbcr') else 'all'
+        elif cmd=='/dbstatus':out=db_status_text()
+        elif cmd in ('/exportsun','/txtsun','/exportbcr','/txtbcr','/exportall','/txtall',
+                     '/exportsunall','/exportbcrall','/exportallresults'):
+            kind = 'sun' if cmd in ('/exportsun','/txtsun','/exportsunall') else 'bcr' if cmd in ('/exportbcr','/txtbcr','/exportbcrall') else 'all'
+            include_all=cmd in ('/exportsunall','/exportbcrall','/exportallresults')
             limit = _parse_txt_limit(arg)
-            count = await send_txt_document(client, chat_id, kind, limit)
-            out = f'✅ Đã xuất TXT {kind.upper()} · {count} phiên có dự đoán đã chốt.'
+            count = await send_txt_document(client, chat_id, kind, limit, include_all)
+            out = f'✅ Đã xuất TXT {kind.upper()} · {count} {"kết quả đã lưu" if include_all else "phiên có dự đoán"}.'
         elif cmd=='/resetlinks':
             with LOCK:CONFIG.clear();CONFIG.update(DEFAULT_CONFIG)
             save_config();out='✅ Đã khôi phục link/API mặc định.'
@@ -989,6 +1023,9 @@ async def bot_loop():
             {'command':'status','description':'Trạng thái API'},{'command':'links','description':'Xem link/API'},
             {'command':'exportsun','description':'Xuất TXT SUNWIN'},{'command':'exportbcr','description':'Xuất TXT Baccarat'},
             {'command':'exportall','description':'Xuất TXT tất cả'},
+            {'command':'exportsunall','description':'Xuất toàn bộ kết quả SUNWIN'},
+            {'command':'exportbcrall','description':'Xuất toàn bộ kết quả Baccarat'},
+            {'command':'dbstatus','description':'Kiểm tra SQLite và phiên API'},
             {'command':'setsunlink','description':'Đổi link game SUNWIN'},{'command':'setsunapi','description':'Đổi API current SUNWIN'},
             {'command':'setsunhistory','description':'Đổi API history SUNWIN'},{'command':'setsunfallback','description':'Đổi API fallback SUNWIN'},{'command':'setbcrapi','description':'Đổi API Baccarat'}]})
         offset=0
