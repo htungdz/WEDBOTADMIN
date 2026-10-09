@@ -10,6 +10,7 @@ from urllib.parse import urlparse, parse_qs
 
 import httpx
 from learning_engine import STRATEGY_NAMES, strategy_predictions, ensemble_prediction
+import auto_cau_learning as acl
 
 BASE_DIR = Path(__file__).resolve().parent
 PORT = int(os.getenv('PORT','8080'))
@@ -103,6 +104,25 @@ def ensure_db():
           PRIMARY KEY(board,length,pattern)
         );
         CREATE INDEX IF NOT EXISTS idx_pattern_board_samples ON pattern_memory(board,samples);
+
+        CREATE TABLE IF NOT EXISTS auto_cau_log(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          board TEXT NOT NULL,
+          external_key TEXT NOT NULL,
+          strategy TEXT NOT NULL,
+          prediction TEXT NOT NULL,
+          actual TEXT NOT NULL,
+          ok INTEGER NOT NULL,
+          created_at REAL NOT NULL,
+          source TEXT NOT NULL DEFAULT 'online',
+          UNIQUE(board,external_key,strategy)
+        );
+        CREATE INDEX IF NOT EXISTS idx_auto_cau_board_id ON auto_cau_log(board,id);
+        CREATE TABLE IF NOT EXISTS auto_cau_state(
+          board TEXT PRIMARY KEY,
+          champion TEXT,
+          updated_at REAL NOT NULL
+        );
 
         CREATE TABLE IF NOT EXISTS current_prediction(
           board TEXT PRIMARY KEY,
@@ -274,13 +294,65 @@ def load_seq(con,board,limit=1400):
 
 
 def load_history_context(con,board,limit=1400):
-    rows=con.execute('SELECT result,meta_json FROM rounds WHERE board=? ORDER BY id DESC LIMIT ?',(board,limit)).fetchall()
-    rows=list(reversed(rows));seq=[];metas=[]
-    for r in rows:
-        seq.append(r['result'])
-        try: metas.append(json.loads(r['meta_json'] or '{}'))
-        except Exception: metas.append({})
-    return seq,metas
+    rows=con.execute('SELECT external_key,result,meta_json FROM rounds WHERE board=? ORDER BY id DESC LIMIT ?',(board,limit)).fetchall()
+    records=[]
+    for r in reversed(rows):
+        try:meta=json.loads(r['meta_json'] or '{}')
+        except Exception:meta={}
+        records.append((str(r['external_key']),r['result'],meta))
+    segment=acl.trailing_segment(records,board)
+    return [r[1] for r in segment],[r[2] for r in segment]
+
+
+def bootstrap_auto_cau_history(con,board):
+    """Populate expert scores causally from existing rounds after upgrade.
+
+    Only considers result prefixes available before each historical outcome.
+    Retrospective walk-forward logs are tagged and must not be confused with
+    live observations; does not overwrite historical predictions or TXT.
+    """
+    have=con.execute('SELECT 1 FROM auto_cau_log WHERE board=? LIMIT 1',(board,)).fetchone()
+    if have:return 0
+    old=con.execute('''SELECT r.external_key,r.result,r.meta_json,r.seen_at,p.prediction legacy
+          FROM rounds r LEFT JOIN prediction_log p
+          ON p.board=r.board AND p.external_key=r.external_key
+          WHERE r.board=? ORDER BY r.id ASC''',(board,)).fetchall()
+    if len(old)<13:return 0
+    history=[];metas=[];last_key=None;last_meta={};count=0
+    for r in old:
+        key=str(r['external_key']);actual=r['result']
+        try:meta=json.loads(r['meta_json'] or '{}')
+        except Exception:meta={}
+        if last_key is not None and not acl.id_contiguous(last_key,key,last_meta,meta,board):
+            history=[];metas=[]
+        if len(history)>=12 and actual in ('TÀI','XỈU'):
+            preds=acl.strategy_predictions(history,board,metas,r['legacy'])
+            con.executemany('INSERT OR IGNORE INTO auto_cau_log(board,external_key,strategy,prediction,actual,ok,created_at,source) VALUES(?,?,?,?,?,?,?,?)',
+                [(board,key,name,pred,actual,1 if pred==actual else 0,float(r['seen_at'] or 0),'backfill') for name,pred in preds.items()])
+            count+=1
+        history.append(actual);metas.append(meta)
+        last_key=key;last_meta=meta
+    return count
+
+
+def load_auto_cau_logs(con,board):
+    from collections import deque
+    rows=con.execute('SELECT strategy,ok FROM auto_cau_log WHERE board=? ORDER BY id DESC LIMIT 1800',(board,)).fetchall()
+    logs={}
+    for r in reversed(rows):
+        logs.setdefault(r['strategy'],deque(maxlen=100)).append(bool(r['ok']))
+    return logs
+
+
+def load_auto_champion(con,board):
+    row=con.execute('SELECT champion FROM auto_cau_state WHERE board=?',(board,)).fetchone()
+    return str(row['champion']) if row and row['champion'] else None
+
+
+def save_auto_champion(con,board,champion,ts):
+    if not champion:return
+    con.execute('''INSERT INTO auto_cau_state(board,champion,updated_at) VALUES(?,?,?)
+        ON CONFLICT(board) DO UPDATE SET champion=excluded.champion,updated_at=excluded.updated_at''',(board,champion,ts))
 
 
 def perf_map(con,board):
@@ -349,14 +421,27 @@ def update_pattern_memory(con,board,seq,actual,ts):
 
 
 def create_current_prediction(con,board,seq,meta_history=None):
-    if len(seq)<6: return None
+    if not seq: return None
     perf=perf_map(con,board);mem=memory_signal(con,board,seq)
     e=ensemble_prediction(seq,perf=perf,memory=mem,board=board,meta_history=meta_history)
-    d={'board':board,'prediction':e['prediction'],'confidence':e['confidence'],
+    caulog=load_auto_cau_logs(con,board)
+    caupred=acl.strategy_predictions(seq,board,meta_history,e['prediction'])
+    caudecision=acl.select_predict(caupred,caulog,load_auto_champion(con,board),seq)
+    cauinfo=acl.detect_cau(seq)
+    final=caudecision['prediction']
+    # Keep calibration conservative: retrospective strategy selection is not a
+    # verified probability of a fair, independently random outcome.
+    conf=min(56.0,float(e['confidence'])) if caudecision['champion'] else float(e['confidence'])
+    d={'board':board,'prediction':final,'confidence':conf,
        'agreement':round(e['agreement']*100,1),'source_len':len(seq),
        'strategy_count':e.get('strategy_count',len(STRATEGY_NAMES)),'memory':e.get('memory'),
        'engine':e.get('engine','OMNI-MAX'),'regime':e.get('regime','MIXED'),'edge':e.get('edge',0),
-       'top':e.get('top',[])[:8],'updated_at':time.time()}
+       'top':e.get('top',[])[:8],'updated_at':time.time(),
+       'cau_type':cauinfo['type'],'cau_clarity':cauinfo['clarity'],
+       'cau_run_length':cauinfo['run_length'],'cau_mode':caudecision['mode'],
+       'cau_champion':caudecision['champion'],
+       'cau_samples':caudecision['sample_count'],
+       'cau_top':caudecision['top']}
     con.execute('''
       INSERT INTO current_prediction(board,prediction,confidence,agreement,source_len,details_json,updated_at)
       VALUES(?,?,?,?,?,?,?)
@@ -373,19 +458,41 @@ def learn_rows(board,rows):
     now=time.time();new_count=0
     with db() as con:
         seq,meta_history=load_history_context(con,board)
+        bootstrap_auto_cau_history(con,board)
         existing={r['external_key'] for r in con.execute('SELECT external_key FROM rounds WHERE board=?',(board,))}
         perf=perf_map(con,board)
+        auto_logs=load_auto_cau_logs(con,board)
+        auto_champion=load_auto_champion(con,board)
+        last_row=con.execute('SELECT external_key,meta_json FROM rounds WHERE board=? ORDER BY id DESC LIMIT 1',(board,)).fetchone()
+        last_key=str(last_row['external_key']) if last_row else None
+        try:last_meta=json.loads(last_row['meta_json'] or '{}') if last_row else {}
+        except Exception:last_meta={}
         pending=[item for item in rows if item.get('result') in ('TÀI','XỈU') and str(item.get('key')) not in existing]
         cold_skip=max(0,len(pending)-72) if not seq else 0
         pending_i=0
         for item in rows:
             key=str(item.get('key'));actual=item.get('result')
             if actual not in ('TÀI','XỈU') or key in existing: continue
+            cur_meta=item.get('meta') or {}
+            if last_key is not None and not acl.id_contiguous(last_key,key,last_meta,cur_meta,board):
+                # A gap or new Baccarat shoe ends the previous curve. Never
+                # treat distant rounds as one contiguous transition.
+                seq=[];meta_history=[]
             do_eval=(pending_i>=cold_skip)
             pending_i+=1
             if len(seq)>=12 and do_eval:
                 mem=memory_signal(con,board,seq)
                 main=ensemble_prediction(seq,perf=perf,memory=mem,board=board,meta_history=meta_history)
+                auto_preds=acl.strategy_predictions(seq,board,meta_history,main['prediction'])
+                decision=acl.select_predict(auto_preds,auto_logs,auto_champion,seq)
+                if decision['champion']:
+                    auto_champion=decision['champion']
+                    save_auto_champion(con,board,auto_champion,now)
+                # Every expert predicts BEFORE this round's actual is known.
+                con.executemany('INSERT OR IGNORE INTO auto_cau_log(board,external_key,strategy,prediction,actual,ok,created_at) VALUES(?,?,?,?,?,?,?)',[(board,key,name,pred,actual,1 if pred==actual else 0,now+pending_i*.00001)
+                    for name,pred in auto_preds.items()])
+                acl.record_settled(auto_logs,auto_preds,actual)
+                final_pred=decision['prediction']
                 preds=main.get('strategies') or strategy_predictions(seq,board,meta_history)
                 logs=[]
                 for name,pred in preds.items():
@@ -395,13 +502,28 @@ def learn_rows(board,rows):
                 if logs:
                     con.executemany('INSERT OR IGNORE INTO strategy_log(board,external_key,strategy,prediction,actual,ok,created_at) VALUES(?,?,?,?,?,?,?)',logs)
                 con.execute('INSERT OR IGNORE INTO prediction_log(board,external_key,prediction,confidence,actual,ok,agreement,memory_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)',
-                            (board,key,main['prediction'],float(main['confidence']),actual,1 if main['prediction']==actual else 0,float(main.get('agreement',.5))*100,
+                            (board,key,final_pred,min(56.,float(main['confidence'])) if decision['champion'] else float(main['confidence']),actual,1 if final_pred==actual else 0,float(main.get('agreement',.5))*100,
                              json.dumps(main.get('memory'),ensure_ascii=False,separators=(',',':')) if main.get('memory') else None,now))
             update_pattern_memory(con,board,seq,actual,now)
             con.execute('INSERT INTO rounds(board,external_key,result,meta_json,seen_at) VALUES(?,?,?,?,?)',(board,key,actual,json.dumps(item.get('meta') or {},ensure_ascii=False,separators=(',',':')),now))
-            existing.add(key);seq.append(actual);meta_history.append(item.get('meta') or {});new_count+=1
+            existing.add(key);seq.append(actual);meta_history.append(cur_meta);new_count+=1
+            last_key=key;last_meta=cur_meta
         create_current_prediction(con,board,seq,meta_history);con.commit()
     return new_count
+
+
+def upgrade_existing_history():
+    """One-time causal replay of prior saved rounds on first new deployment.
+
+    Does not alter pre-existing prediction_log or TXT records.
+    """
+    with db() as con:
+        boards=[r[0] for r in con.execute('SELECT DISTINCT board FROM rounds')]
+        for board in boards:
+            bootstrap_auto_cau_history(con,board)
+            seq,metas=load_history_context(con,board)
+            if seq:create_current_prediction(con,board,seq,metas)
+        con.commit()
 
 
 def learn_payloads(sun_history=None,sun_current=None,bcr_payload=None):
@@ -432,10 +554,12 @@ def summary_payload():
         patterns=int(con.execute('SELECT COUNT(*) FROM pattern_memory').fetchone()[0]);mature=int(con.execute('SELECT COUNT(*) FROM pattern_memory WHERE samples>=5').fetchone()[0])
         sample=int(con.execute('SELECT COALESCE(SUM(samples),0) FROM pattern_memory').fetchone()[0]);pr=con.execute('SELECT COUNT(*) n,COALESCE(SUM(ok),0) w FROM prediction_log').fetchone()
         sn=int(pr['n'] or 0);sw=int(pr['w'] or 0);strategies=int(con.execute('SELECT COUNT(DISTINCT strategy) FROM strategy_log').fetchone()[0])
+    with db() as con:
+        ac=con.execute("SELECT COUNT(*) n,COUNT(DISTINCT strategy) strategies,COALESCE(SUM(CASE WHEN source='backfill' THEN 1 ELSE 0 END),0) backfill FROM auto_cau_log").fetchone()
     with LOCK:st=dict(LEARN_STATUS)
-    return {'ok':True,'rounds':rounds,'boards':boards,'patterns':patterns,'mature_patterns':mature,'pattern_samples':sample,
+    return {'ok':True,'auto_cau_logs':int(ac['n'] or 0),'auto_cau_strategies':int(ac['strategies'] or 0),'auto_cau_backfill':int(ac['backfill'] or 0),'rounds':rounds,'boards':boards,'patterns':patterns,'mature_patterns':mature,'pattern_samples':sample,
             'settled_predictions':sn,'wins':sw,'win_rate':round(sw/sn*100,2) if sn else None,'strategies':strategies,
-            'engine':f'{len(STRATEGY_NAMES)} strategy catalog OMNI-MAX + live pattern memory 2-12','learner':st}
+            'engine':f'CLASSIC V3 + AUTO CẦU ({len(STRATEGY_NAMES)} chiến lược gốc)','learner':st}
 
 
 def board_rows_payload():
@@ -761,7 +885,7 @@ def stats_text():
     return (f'<b>📊 THỐNG KÊ HỌC NỀN 24/7</b>\n━━━━━━━━━━━━━━━━━━\n'
             f'📚 Phiên đã học: <b>{s["rounds"]}</b>\n🎮 Số bàn: <b>{s["boards"]}</b>\n〽️ Pattern unique: <b>{s["patterns"]}</b>\n'
             f'🔥 Pattern đủ ≥5 mẫu: <b>{s["mature_patterns"]}</b>\n🧩 Tổng lượt học pattern: <b>{s["pattern_samples"]}</b>\n'
-            f'🧠 Strategy đang có log: <b>{s["strategies"]}/{len(STRATEGY_NAMES)}</b>\n🎯 Dự đoán walk-forward: <b>{s["settled_predictions"]}</b>\n'
+            f'🧠 Strategy đang có log: <b>{s["strategies"]}/{len(STRATEGY_NAMES)}</b>\n🧩 Auto cầu: <b>{s["auto_cau_strategies"]}</b> chiến lược · {s["auto_cau_logs"]} lượt kiểm\n🎯 Dự đoán walk-forward: <b>{s["settled_predictions"]}</b>\n'
             f'✅ Đúng: <b>{s["wins"]}</b> · {rate}\n♻️ Chu kỳ worker: <b>{s["learner"]["cycles"]}</b>\n⏱ Uptime: <b>{up//3600}h {(up%3600)//60}m</b>\n\n'
             '<i>% là thống kê lịch sử đã chốt, không phải bảo đảm phiên sau.</i>')
 
@@ -880,7 +1004,7 @@ async def bot_loop():
 
 
 async def main_async():
-    load_config();ensure_db();load_latest_from_db();threading.Thread(target=run_http,daemon=True).start();await asyncio.gather(cache_loop(),bot_loop())
+    load_config();ensure_db();upgrade_existing_history();load_latest_from_db();threading.Thread(target=run_http,daemon=True).start();await asyncio.gather(cache_loop(),bot_loop())
 
 
 if __name__=='__main__':
