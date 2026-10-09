@@ -184,44 +184,90 @@ def record_settled(logs, predictions, actual):
 
 
 def _score(window):
-    # Smoothed short/mid/long score with smaller-sample penalty.
+    """Shrunk, chronological observed score, never a future probability.
+
+    Only previously settled rounds can influence the next decision.
+    A prior centered at 50% and a sample floor reduce lucky champions.
+    """
     n=len(window)
-    if n<12:return -1.
+    if n<25:return -1.
     w20=window[-20:];w50=window[-50:];w100=window[-100:]
-    def rate(xs):return (sum(xs)+6)/(len(xs)+12)
-    value=.50*rate(w20)+.35*rate(w50)+.15*rate(w100)
-    value-=.065*(1-min(1.,n/40.))
-    if len(window)>=3 and not any(window[-3:]):value-=.035
-    return value
+    def rate(xs):return (sum(xs)+12)/(len(xs)+24)
+    value=.40*rate(w20)+.40*rate(w50)+.20*rate(w100)
+    if n<45:value-=.03
+    if len(window)>=4 and sum(window[-4:])==0:value-=.035
+    # Penalize extensive model selection: with many experts, lucky winners
+    # overfit historical noise. No strategy has a guaranteed edge.
+    return value-.012
+
+
+def _fallback_prediction(preds, history=None):
+    """No CLASSIC-only fallback; neutral if no evidence for a transition.
+
+    Uses only prior outcomes. A deterministic hash tie-break is explicitly
+    non-predictive, and removes systematic default-TÀI preference.
+    """
+    import hashlib
+    hist=[x for x in (history or []) if x in (T,X)]
+    if len(hist)>=16:
+        prior=hist[-100:]
+        t=x=2.0
+        for j in range(1,len(prior)):
+            if prior[j-1]==prior[-1]:
+                if prior[j]==T:t+=1
+                else:x+=1
+        n=t+x
+        if n>=14 and abs(t-x)/n>=.11:
+            return _choose(t,x,hist[-1]), 'CHUYỂN TRẠNG THÁI'
+        # Short and long class shares can differ. Do not chase a streak blindly.
+        a=hist[-24:]
+        count=a.count(T)
+        if len(a)>=20 and (count>=17 or count<=7):
+            return (X if count>=17 else T), 'HIỆU CHỈNH LỆCH CẦU'
+    if hist:
+        # Alternating hash is only a tie-break, not claimed to forecast dice.
+        raw=''.join('T' if x==T else 'X' for x in hist[-32:]).encode()
+        b=hashlib.blake2s(raw,digest_size=1).digest()[0]
+        return (T if b&1 else X), 'DỮ LIỆU YẾU'
+    return T,'KHỞI TẠO'
 
 
 def select_predict(preds, logs, current_champion=None, history=None):
-    """Champion chosen using only previously settled labels for each expert.
+    """Select a tested expert only with enough prior evidence.
 
-    Returns conservative historic signal and a fallback prediction; never SKIP.
+    Champion quality must outperform both chance-level and a trivial
+    fixed-side historical baseline by a *margin*, avoiding habitual TÀI picks
+    caused by an ensemble of many correlated experts.
     """
     scores={name:_score(list(logs.get(name,()))) for name in preds}
-    valid=[(v,k) for k,v in scores.items() if v>=.50 and len(logs.get(k,()))>=20]
+    h=[x for x in (history or []) if x in (T,X)]
+    recent=h[-50:]
+    # Fixed-side scores are diagnostic benchmark, not a prediction.
+    fixed=(max(recent.count(T),recent.count(X))+12)/(len(recent)+24) if len(recent)>=25 else .5
+    bar=max(.515,fixed+.018)
+    valid=[(v,k) for k,v in scores.items() if v>=bar and len(logs.get(k,()))>=40]
     valid.sort(reverse=True)
     champion=valid[0][1] if valid else None
     if current_champion in preds and current_champion in scores and champion and current_champion!=champion:
         prior=scores[current_champion]
-        wins=logs.get(current_champion,())
-        if prior>=.48 and (not len(wins)>=3 or any(list(wins)[-3:])) and scores[champion]-prior<.08:
+        wins=list(logs.get(current_champion,()))
+        if (prior>=bar-.015 and len(wins)>=3 and any(wins[-3:])
+                and scores[champion]-prior<.055):
             champion=current_champion
     if champion:
         pick=preds[champion]
         strength=scores[champion]
         n=len(logs.get(champion,()))
-        return {'prediction':pick,'champion':champion,'mode':'HỌC CẦU',
+        return {'prediction':pick,'champion':champion,'mode':'HỌC CẦU KIỂM CHỨNG',
                 'sample_count':n,'historical_score':round(strength,4),
-                'top':sorted(({'name':k,'score':round(v,4),'n':len(logs.get(k,()))} for k,v in scores.items() if v>=0),key=lambda x:x['score'],reverse=True)[:5]}
-    # No sufficient evidence: use unsupervised Markov or Classic prediction.
-    fallback=preds.get('CLASSIC_V3') or preds.get('MARKOV_2') or preds.get('MARKOV_1')
-    if not fallback: fallback=preds.get('REVERSE_LAST') or preds.get('FOLLOW_LAST') or T
-    return {'prediction':fallback,'champion':None,'mode':'KHỞI ĐỘNG',
-            'sample_count':0,'historical_score':.5,'top':[]}
-
+                'baseline_score':round(fixed,4),
+                'top':sorted(({'name':k,'score':round(v,4),'n':len(logs.get(k,()))}
+                              for k,v in scores.items() if v>=0),
+                             key=lambda x:x['score'],reverse=True)[:5]}
+    fallback,reason=_fallback_prediction(preds,history)
+    return {'prediction':fallback,'champion':None,'mode':reason,
+            'sample_count':len(h),'historical_score':.5,
+            'baseline_score':round(fixed,4),'top':[]}
 
 def id_contiguous(previous_key, current_key, prev_meta=None, cur_meta=None, board=''):
     """Conservative gap check: do not learn a bridge over missing sessions/shoes."""
@@ -246,3 +292,10 @@ def trailing_segment(rows,board):
         if not id_contiguous(pre[0],cur[0],pre[2],cur[2],board):break
         start-=1
     return rows[start:]
+
+
+# V6 delegates to a version-tagged expert catalog. Older V5 logs remain
+# available for audit but MUST NOT calibrate these changed strategies.
+from v6_engine import strategies as strategy_predictions
+from v6_engine import select as select_predict
+from v6_engine import append_result as record_settled
