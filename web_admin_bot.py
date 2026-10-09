@@ -134,6 +134,18 @@ def ensure_db():
           updated_at REAL NOT NULL
         );
         """)
+        # Non-destructive migration: old prediction rows were recreated from
+        # historical rounds, not verifiable forecasts issued before settlement.
+        columns={r[1] for r in con.execute('PRAGMA table_info(prediction_log)')}
+        if 'source' not in columns:
+            con.execute("ALTER TABLE prediction_log ADD COLUMN source TEXT NOT NULL DEFAULT 'replay'")
+        con.execute("""CREATE TABLE IF NOT EXISTS issued_forecasts(
+            board TEXT NOT NULL,
+            base_key TEXT NOT NULL,
+            prediction TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY(board,base_key)
+        )""")
         con.commit()
 
 
@@ -311,7 +323,10 @@ def bootstrap_auto_cau_history(con,board):
     Retrospective walk-forward logs are tagged and must not be confused with
     live observations; does not overwrite historical predictions or TXT.
     """
-    have=con.execute('SELECT 1 FROM auto_cau_log WHERE board=? LIMIT 1',(board,)).fetchone()
+    # V6 is a new catalog with changed algorithms. Score the V6 experts
+    # from historical prefixes even if V4/V5 logs already exist. Otherwise a
+    # deployed V5 database incorrectly prevents the new models from learning.
+    have=con.execute("SELECT 1 FROM auto_cau_log WHERE board=? AND strategy LIKE 'V6_%' LIMIT 1",(board,)).fetchone()
     if have:return 0
     old=con.execute('''SELECT r.external_key,r.result,r.meta_json,r.seen_at,p.prediction legacy
           FROM rounds r LEFT JOIN prediction_log p
@@ -337,10 +352,15 @@ def bootstrap_auto_cau_history(con,board):
 
 def load_auto_cau_logs(con,board):
     from collections import deque
-    rows=con.execute('SELECT strategy,ok FROM auto_cau_log WHERE board=? ORDER BY id DESC LIMIT 1800',(board,)).fetchall()
+    # Read the latest 100 settled observations per V6 expert, retaining the
+    # actual/predicted labels so each candidate is compared with a fixed-side
+    # baseline on THE SAME rounds (not an unrelated recent class ratio).
+    rows=con.execute('''SELECT strategy,ok,actual,prediction FROM auto_cau_log
+        WHERE board=? AND strategy LIKE 'V6_%' ORDER BY id DESC LIMIT 8000''',(board,)).fetchall()
     logs={}
     for r in reversed(rows):
-        logs.setdefault(r['strategy'],deque(maxlen=100)).append(bool(r['ok']))
+        logs.setdefault(r['strategy'],deque(maxlen=100)).append({
+          'correct':int(r['ok']), 'actual':r['actual'], 'prediction':r['prediction']})
     return logs
 
 
@@ -431,7 +451,7 @@ def create_current_prediction(con,board,seq,meta_history=None):
     final=caudecision['prediction']
     # Keep calibration conservative: retrospective strategy selection is not a
     # verified probability of a fair, independently random outcome.
-    conf=min(56.0,float(e['confidence'])) if caudecision['champion'] else float(e['confidence'])
+    conf=min(55.0, 50.0+max(0.0,caudecision['historical_score']-.50)*35.0) if caudecision['champion'] else 50.0
     d={'board':board,'prediction':final,'confidence':conf,
        'agreement':round(e['agreement']*100,1),'source_len':len(seq),
        'strategy_count':e.get('strategy_count',len(STRATEGY_NAMES)),'memory':e.get('memory'),
@@ -441,6 +461,7 @@ def create_current_prediction(con,board,seq,meta_history=None):
        'cau_run_length':cauinfo['run_length'],'cau_mode':caudecision['mode'],
        'cau_champion':caudecision['champion'],
        'cau_samples':caudecision['sample_count'],
+       'cau_baseline':caudecision.get('baseline_score',.5),
        'cau_top':caudecision['top']}
     con.execute('''
       INSERT INTO current_prediction(board,prediction,confidence,agreement,source_len,details_json,updated_at)
@@ -449,6 +470,13 @@ def create_current_prediction(con,board,seq,meta_history=None):
         agreement=excluded.agreement,source_len=excluded.source_len,details_json=excluded.details_json,
         updated_at=excluded.updated_at
     ''',(board,d['prediction'],d['confidence'],d['agreement'],len(seq),json.dumps(d,ensure_ascii=False,separators=(',',':')),d['updated_at']))
+    # Immutable pre-outcome forecast for auditing true live accuracy. This
+    # records what the web/API would show *before* the next round is received.
+    # A reboot does not overwrite the first forecast for a given base round.
+    base=con.execute('SELECT external_key FROM rounds WHERE board=? ORDER BY id DESC LIMIT 1',(board,)).fetchone()
+    if base:
+        con.execute('INSERT OR IGNORE INTO issued_forecasts(board,base_key,prediction,created_at) VALUES(?,?,?,?)',
+                    (board,str(base['external_key']),final,d['updated_at']))
     with LOCK: LATEST[board]=d
     return d
 
@@ -493,6 +521,14 @@ def learn_rows(board,rows):
                     for name,pred in auto_preds.items()])
                 acl.record_settled(auto_logs,auto_preds,actual)
                 final_pred=decision['prediction']
+                # Only count a forecast as LIVE if it was stored before the
+                # result and directly followed the previous observed round.
+                issued=None
+                if last_key is not None and acl.id_contiguous(last_key,key,last_meta,cur_meta,board):
+                    issued=con.execute('SELECT prediction,created_at FROM issued_forecasts WHERE board=? AND base_key=?',
+                                       (board,last_key)).fetchone()
+                is_live=bool(issued and issued['created_at']<now and issued['prediction'] in ('TÀI','XỈU'))
+                if is_live: final_pred=issued['prediction']
                 preds=main.get('strategies') or strategy_predictions(seq,board,meta_history)
                 logs=[]
                 for name,pred in preds.items():
@@ -501,9 +537,10 @@ def learn_rows(board,rows):
                     st=perf.setdefault(name,{'n':0,'wins':0});st['n']+=1;st['wins']+=ok
                 if logs:
                     con.executemany('INSERT OR IGNORE INTO strategy_log(board,external_key,strategy,prediction,actual,ok,created_at) VALUES(?,?,?,?,?,?,?)',logs)
-                con.execute('INSERT OR IGNORE INTO prediction_log(board,external_key,prediction,confidence,actual,ok,agreement,memory_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)',
-                            (board,key,final_pred,min(56.,float(main['confidence'])) if decision['champion'] else float(main['confidence']),actual,1 if final_pred==actual else 0,float(main.get('agreement',.5))*100,
-                             json.dumps(main.get('memory'),ensure_ascii=False,separators=(',',':')) if main.get('memory') else None,now))
+                con.execute('INSERT OR IGNORE INTO prediction_log(board,external_key,prediction,confidence,actual,ok,agreement,memory_json,created_at,source) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                            (board,key,final_pred,min(55.,50.+max(0.,decision['historical_score']-.50)*35.) if decision['champion'] else 50.0,actual,1 if final_pred==actual else 0,float(main.get('agreement',.5))*100,
+                             json.dumps(main.get('memory'),ensure_ascii=False,separators=(',',':')) if main.get('memory') else None,now,
+                             'live' if is_live else 'replay'))
             update_pattern_memory(con,board,seq,actual,now)
             con.execute('INSERT INTO rounds(board,external_key,result,meta_json,seen_at) VALUES(?,?,?,?,?)',(board,key,actual,json.dumps(item.get('meta') or {},ensure_ascii=False,separators=(',',':')),now))
             existing.add(key);seq.append(actual);meta_history.append(cur_meta);new_count+=1
@@ -848,22 +885,89 @@ async def tg(client,method,payload):
     except Exception:return None
 
 
-def admin_keyboard():
-    return {'inline_keyboard':[
-        [{'text':'📊 HỌC CẦU','callback_data':'adm:stats'},{'text':'🏆 TOP THUẬT TOÁN','callback_data':'adm:algo'}],
-        [{'text':'🎮 BÀN ĐÃ HỌC','callback_data':'adm:boards'},{'text':'📡 API STATUS','callback_data':'adm:api'}],
-        [{'text':'📄 TXT SUNWIN','callback_data':'adm:exportsun'},{'text':'📄 TXT BCR','callback_data':'adm:exportbcr'}],
-        [{'text':'🔗 LINK / API','callback_data':'adm:links'}]
-    ]}
+def admin_keyboard(page='home'):
+    """Single compact Telegram inline menu; callback navigation edits one message."""
+    def b(text,action):return {'text':text,'callback_data':'adm:'+action}
+    home=[
+        [b('🧠 HỌC CẦU','stats'),b('🎮 CÁC BÀN','boards')],
+        [b('🩺 KIỂM TRA','health'),b('🏆 MODEL TOP','algo')],
+        [b('📄 XUẤT TXT','export'),b('🔗 API / LINK','links')],
+    ]
+    if page=='home': rows=home
+    elif page=='export':rows=[
+        [b('📥 SUNWIN','exportsun'),b('📥 BCR','exportbcr')],
+        [b('📚 SUN TOÀN BỘ','exportsunall'),b('📚 BCR TOÀN BỘ','exportbcrall')],
+        [b('📊 XUẤT CẢ HAI','exportall')],
+    ]
+    elif page=='health':rows=[[b('🛰 KIỂM TRA API','api'),b('🗃️ SQLITE','dbstatus')],[b('📉 LỆCH TÀI/XỈU','bias')]]
+    elif page=='stats':rows=[[b('📉 LỆCH TÀI/XỈU','bias'),b('🏆 TOP MODEL','algo')],[b('🎮 THEO BÀN','boards')]]
+    elif page=='boards':rows=[[b('🧠 THỐNG KÊ','stats'),b('🩺 CHẨN ĐOÁN','health')]]
+    elif page=='algo':rows=[[b('📊 THỐNG KÊ','stats'),b('📉 LỆCH','bias')]]
+    elif page in ('api','dbstatus','bias'):rows=[[b('🩺 CHẨN ĐOÁN','health'),b('📊 HỌC CẦU','stats')]]
+    else:rows=home
+    if page!='home':rows.append([b('⌂ TRANG CHỦ','home'),b('📄 TXT','export')])
+    return {'inline_keyboard':rows}
 
 
 def admin_home():
     s=summary_payload();rate='—' if s['win_rate'] is None else f"{s['win_rate']}%"
-    return (f'<b>⚙️ DEVELOPER THANHTUNG · ADMIN</b>\n━━━━━━━━━━━━━━━━━━\n'
-            f'🧠 Engine: <b>OMNI-MAX · {len(STRATEGY_NAMES)} strategy catalog</b>\n📚 Phiên đã học: <b>{s["rounds"]}</b>\n'
-            f'〽️ Cầu/mẫu đã học: <b>{s["patterns"]}</b> · chín {s["mature_patterns"]}\n'
-            f'🎯 Backtest causal: <b>{s["settled_predictions"]}</b> · {rate}\n🎮 Bàn: <b>{s["boards"]}</b>\n\n'
-            'Backend học 24/7 kể cả khi không ai mở web.')
+    api=cache_public('sun_current');fresh='🟢 ONLINE' if api.get('ok') and time.time()-api.get('ts',0)<120 else '🟡 CHƯA CẬP NHẬT'
+    return (f'<b>🤖 DEVELOPER THANHTUNG</b>\n'
+            f'<i>CONTROL CENTER · CLASSIC V5</i>\n'
+            f'━━━━━━━━━━━━━━━━━━\n'
+            f'📡 SUNWIN API: <b>{fresh}</b>\n'
+            f'📚 Đã lưu: <b>{s["rounds"]}</b> kết quả\n'
+            f'🎮 Bàn đang theo dõi: <b>{s["boards"]}</b>\n'
+            f'🧠 Mẫu cầu: <b>{s["patterns"]}</b>\n'
+            f'🎯 Lịch sử dự đoán: <b>{s["settled_predictions"]}</b> · {rate}\n\n'
+            '<i>Chọn chức năng bên dưới. Tỷ lệ lịch sử không bảo đảm ván sau.</i>')
+
+
+def model_health_text():
+    """Shows factual, settled predicted-vs-actual imbalance (not a prediction)."""
+    try:
+        with db() as con:
+            rows=con.execute("""SELECT prediction,actual,ok,source FROM prediction_log
+                    WHERE board='sunwin:hu' ORDER BY created_at DESC LIMIT 100""").fetchall()
+            latest=con.execute("SELECT external_key FROM rounds WHERE board='sunwin:hu' ORDER BY id DESC LIMIT 1").fetchone()
+        def fmt(n):
+            segment=rows[:n]
+            if not segment:return '—'
+            n0=len(segment);won=sum(int(x['ok']) for x in segment)
+            pt=sum(x['prediction']=='TÀI' for x in segment)
+            at=sum(x['actual']=='TÀI' for x in segment)
+            return f'{won}/{n0} ({100*won/n0:.1f}%) · bot TÀI {pt}/{n0} · thực TÀI {at}/{n0}'
+        def skew(n):
+            z=rows[:n]
+            return len(z)>=20 and abs(sum(x['prediction']=='TÀI' for x in z)/len(z)-.5)>.25
+        warn='\n⚠️ <b>Thiên lệch dự đoán: đã phát hiện</b>' if skew(50) else ''
+        live=[r for r in rows if r['source']=='live']
+        live_line=('Chưa đủ bản ghi live' if not live else
+                   f'{sum(x["ok"] for x in live)}/{len(live)} ({100*sum(x["ok"] for x in live)/len(live):.1f}%)')
+        return ('<b>📉 KIỂM TRA LỆCH DỰ ĐOÁN</b>\n━━━━━━━━━━━━━━━━━━\n'
+                +f'📍 Phiên cuối: <b>{html.escape(str(latest[0])) if latest else "—"}</b>\n'
+                +f'20 phiên: {fmt(20)}\n'
+                +f'50 phiên: {fmt(50)}\n'
+                +f'100 phiên: {fmt(100)}\n'
+                +f'🟢 Dự đoán LIVE: <b>{live_line}</b>\n'
+                +warn+'\n\n<i>LIVE là dự đoán lưu trước khi có kết quả; các số 20/50/100 có thể chứa bản ghi REPLAY (tái dựng).</i>')
+    except Exception as exc:return '❌ Lỗi đọc SQLite: '+html.escape(str(exc))
+
+
+def export_menu_text():
+    return ('<b>📄 XUẤT LỊCH SỬ · TXT</b>\n━━━━━━━━━━━━━━━━━━\n'
+            '📥 TXT SUNWIN/BCR: chỉ phiên <b>có dự đoán</b>.\n'
+            '📚 TOÀN BỘ: cả phiên không dự đoán.\n\n'
+            'Dùng <code>/exportsun 500</code> hoặc <code>/exportbcr 500</code> '
+            'để giới hạn số phiên.\n<i>Không tạo dữ liệu hoặc dự đoán giả.</i>')
+
+
+def health_menu_text():
+    return ('<b>🩺 CHẨN ĐOÁN HỆ THỐNG</b>\n━━━━━━━━━━━━━━━━━━\n'
+            '🛰 API: dữ liệu online có cập nhật không?\n'
+            '🗃️ SQLite: phiên đã lưu và phiên cuối?\n'
+            '📉 Lệch: bot có chọn TÀI/XỈU bất thường?\n\n'
+            '<i>Chọn bên dưới để xem chi tiết.</i>')
 
 
 def api_status_text():
@@ -951,9 +1055,9 @@ def links_text():
             f'<b>BCR API</b>\n<code>{html.escape(cfg["bcr_api"])}</code>\n\n<code>/setsunlink URL</code>\n<code>/setsunapi URL</code>\n<code>/setsunhistory URL</code>\n<code>/setbcrapi URL</code>')
 
 
-async def send_admin(client,chat_id,text,keyboard=True):
+async def send_admin(client,chat_id,text,keyboard=True,page='home'):
     p={'chat_id':chat_id,'text':text,'parse_mode':'HTML','disable_web_page_preview':True}
-    if keyboard:p['reply_markup']=admin_keyboard()
+    if keyboard:p['reply_markup']=admin_keyboard(page)
     return await tg(client,'sendMessage',p)
 
 
@@ -972,6 +1076,9 @@ async def handle_admin_message(client,m):
         elif cmd in ('/topalgo','/algo'):out=algo_text()
         elif cmd=='/links':out=links_text()
         elif cmd=='/dbstatus':out=db_status_text()
+        elif cmd in ('/bias','/modelhealth'):out=model_health_text()
+        elif cmd=='/diagnose':out=health_menu_text()
+        elif cmd=='/exportmenu':out=export_menu_text()
         elif cmd in ('/exportsun','/txtsun','/exportbcr','/txtbcr','/exportall','/txtall',
                      '/exportsunall','/exportbcrall','/exportallresults'):
             kind = 'sun' if cmd in ('/exportsun','/txtsun','/exportsunall') else 'bcr' if cmd in ('/exportbcr','/txtbcr','/exportbcrall') else 'all'
@@ -991,24 +1098,37 @@ async def handle_admin_message(client,m):
                 save_config();out=f'✅ Đã cập nhật <b>{key}</b>\n<code>{html.escape(arg)}</code>'
             else:out=admin_home()
     except Exception as e:out='❌ '+html.escape(str(e))
-    await send_admin(client,chat_id,out,True)
+    page=({'/bias':'bias','/modelhealth':'bias','/diagnose':'health','/exportmenu':'export',
+           '/dbstatus':'dbstatus','/stats':'stats','/learn':'stats','/boards':'boards',
+           '/algo':'algo','/topalgo':'algo','/api':'api','/status':'api','/links':'links'}).get(cmd,'home')
+    await send_admin(client,chat_id,out,True,page)
 
 
 async def handle_callback(client,q):
     uid=(q.get('from') or {}).get('id');msg=q.get('message') or {};chat_id=(msg.get('chat') or {}).get('id')
     await tg(client,'answerCallbackQuery',{'callback_query_id':q.get('id')})
     if uid not in ADMIN_IDS or not chat_id:return
-    data=q.get('data') or ''
-    if data in ('adm:exportsun','adm:exportbcr'):
-        kind='sun' if data=='adm:exportsun' else 'bcr'
+    data=q.get('data') or '';page=data.replace('adm:','',1)
+    if page in ('exportsun','exportbcr','exportsunall','exportbcrall','exportall'):
+        kind='sun' if page in ('exportsun','exportsunall') else 'bcr' if page in ('exportbcr','exportbcrall') else 'all'
+        include_all=page.endswith('all') and page!='exportall'
         try:
-            count=await send_txt_document(client,chat_id,kind)
-            await send_admin(client,chat_id,f'✅ Đã xuất TXT {kind.upper()} · {count} phiên.',True)
+            count=await send_txt_document(client,chat_id,kind,include_unpredicted=include_all)
+            text=f'✅ Đã gửi TXT {kind.upper()} · {count} phiên.'
         except Exception as e:
-            await send_admin(client,chat_id,'❌ Không xuất được TXT: '+html.escape(str(e)),True)
-        return
-    out={'adm:stats':stats_text,'adm:algo':algo_text,'adm:boards':boards_text,'adm:api':api_status_text,'adm:links':links_text}.get(data,admin_home)()
-    await send_admin(client,chat_id,out,True)
+            text='❌ Không xuất được TXT: '+html.escape(str(e))
+        await send_admin(client,chat_id,text,True,'export');return
+    pages={'home':admin_home,'stats':stats_text,'boards':boards_text,
+           'algo':algo_text,'api':api_status_text,'links':links_text,
+           'dbstatus':db_status_text,'bias':model_health_text,
+           'health':health_menu_text,'export':export_menu_text}
+    if page not in pages:page='home'
+    content=pages[page]()
+    payload={'chat_id':chat_id,'message_id':msg.get('message_id'),
+             'text':content,'parse_mode':'HTML','disable_web_page_preview':True,
+             'reply_markup':admin_keyboard(page)}
+    if msg.get('message_id') and await tg(client,'editMessageText',payload) is not None:return
+    await send_admin(client,chat_id,content,True,page)
 
 
 async def bot_loop():
@@ -1026,6 +1146,8 @@ async def bot_loop():
             {'command':'exportsunall','description':'Xuất toàn bộ kết quả SUNWIN'},
             {'command':'exportbcrall','description':'Xuất toàn bộ kết quả Baccarat'},
             {'command':'dbstatus','description':'Kiểm tra SQLite và phiên API'},
+            {'command':'bias','description':'Chẩn đoán lệch dự đoán'},
+            {'command':'diagnose','description':'Trung tâm kiểm tra'},
             {'command':'setsunlink','description':'Đổi link game SUNWIN'},{'command':'setsunapi','description':'Đổi API current SUNWIN'},
             {'command':'setsunhistory','description':'Đổi API history SUNWIN'},{'command':'setsunfallback','description':'Đổi API fallback SUNWIN'},{'command':'setbcrapi','description':'Đổi API Baccarat'}]})
         offset=0
